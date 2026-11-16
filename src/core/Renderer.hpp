@@ -12,6 +12,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -20,11 +21,24 @@ class Window;
 class Swapchain;
 
 /**
- * @brief Istanza di un oggetto scenico (albero o roccia) posizionato sul terreno.
+ * @brief Categoria geometrica per le istanze sceniche nel mondo 3D.
+ */
+enum class PropType : uint8_t {
+    PineTree = 0,
+    GoldTree,
+    CrimsonTree,
+    ShoreBush,
+    Rock,
+    StoneSanctuary,
+    RuinedPillar
+};
+
+/**
+ * @brief Istanza di un oggetto scenico posizionato sul terreno o nel lago.
  */
 struct PropInstance {
     glm::mat4 model{1.0f};
-    bool isTree{true};
+    PropType type{PropType::PineTree};
 };
 
 /**
@@ -90,6 +104,11 @@ private:
     Mesh m_waterMesh;
     Mesh m_treeMesh;
     Mesh m_rockMesh;
+    Mesh m_goldTreeMesh;
+    Mesh m_crimsonTreeMesh;
+    Mesh m_bushMesh;
+    Mesh m_sanctuaryMesh;
+    Mesh m_pillarMesh;
     std::vector<PropInstance> m_propInstances;
 
     // Dear ImGui Telemetry & Inspector
@@ -123,6 +142,7 @@ private:
     [[nodiscard]] VkExtent2D resolvePsxExtent() const noexcept;
     void createSceneResources();
     void populateProps();
+    [[nodiscard]] uint32_t drawPropMesh(VkCommandBuffer cmd, PropType type) const noexcept;
     void processInput();
     void readTimestampQueries(uint32_t frameIndex);
     void updateVmaStats();

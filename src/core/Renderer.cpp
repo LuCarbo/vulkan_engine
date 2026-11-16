@@ -54,6 +54,11 @@ Renderer::~Renderer() {
         m_imguiLayer.reset();
     }
 
+    m_pillarMesh.cleanup();
+    m_sanctuaryMesh.cleanup();
+    m_bushMesh.cleanup();
+    m_crimsonTreeMesh.cleanup();
+    m_goldTreeMesh.cleanup();
     m_rockMesh.cleanup();
     m_treeMesh.cleanup();
     m_waterMesh.cleanup();
@@ -389,41 +394,273 @@ void Renderer::createSceneResources() {
     m_waterMesh = Mesh::createWaterPlane(m_context, 90, 90.0f, -0.25f);
     m_treeMesh = Mesh::loadFromObj(m_context, "assets/pine_tree.obj", { 0.14f, 0.45f, 0.20f });
     m_rockMesh = Mesh::loadFromObj(m_context, "assets/rock.obj", { 0.50f, 0.49f, 0.46f });
+    m_goldTreeMesh = Mesh::createBroadleafTree(m_context, { 0.88f, 0.62f, 0.14f }, "Golden Autumn Tree Mesh");
+    m_crimsonTreeMesh = Mesh::createBroadleafTree(m_context, { 0.78f, 0.25f, 0.16f }, "Crimson Maple Tree Mesh");
+    m_bushMesh = Mesh::createBushAndReeds(m_context);
+    m_sanctuaryMesh = Mesh::createStoneRuins(m_context);
+    m_pillarMesh = Mesh::createRuinedPillar(m_context);
 
     populateProps();
+}
+
+uint32_t Renderer::drawPropMesh(VkCommandBuffer cmd, PropType type) const noexcept {
+    switch (type) {
+        case PropType::GoldTree:
+            m_goldTreeMesh.bindAndDraw(cmd);
+            return m_goldTreeMesh.getTriangleCount();
+        case PropType::CrimsonTree:
+            m_crimsonTreeMesh.bindAndDraw(cmd);
+            return m_crimsonTreeMesh.getTriangleCount();
+        case PropType::ShoreBush:
+            m_bushMesh.bindAndDraw(cmd);
+            return m_bushMesh.getTriangleCount();
+        case PropType::Rock:
+            m_rockMesh.bindAndDraw(cmd);
+            return m_rockMesh.getTriangleCount();
+        case PropType::StoneSanctuary:
+            m_sanctuaryMesh.bindAndDraw(cmd);
+            return m_sanctuaryMesh.getTriangleCount();
+        case PropType::RuinedPillar:
+            m_pillarMesh.bindAndDraw(cmd);
+            return m_pillarMesh.getTriangleCount();
+        case PropType::PineTree:
+        default:
+            m_treeMesh.bindAndDraw(cmd);
+            return m_treeMesh.getTriangleCount();
+    }
 }
 
 void Renderer::populateProps() {
     m_propInstances.clear();
 
-    std::mt19937 rng(2026);
-    std::uniform_real_distribution<float> jitterDist(-1.2f, 1.2f);
-    std::uniform_real_distribution<float> yawDist(0.0f, 360.0f);
-    std::uniform_real_distribution<float> treeScaleDist(0.85f, 1.45f);
-    std::uniform_real_distribution<float> rockScaleDist(0.65f, 1.55f);
-    std::uniform_real_distribution<float> chanceDist(0.0f, 1.0f);
+    constexpr float waterLevel = -0.25f;
+    constexpr float islandX = 1.5f;
+    constexpr float islandZ = -1.0f;
+    constexpr float overlookX = 16.5f;
+    constexpr float overlookZ = 13.5f;
 
-    for (float gx = -38.0f; gx <= 38.0f; gx += 4.2f) {
-        for (float gz = -38.0f; gz <= 38.0f; gz += 4.2f) {
+    // 1. Landmark: Central Lake Island Sanctuary
+    {
+        const float islandY = Mesh::sampleTerrainHeight(islandX, islandZ);
+        glm::mat4 model(1.0f);
+        model = glm::translate(model, glm::vec3(islandX, islandY - 0.12f, islandZ));
+        model = glm::rotate(model, glm::radians(25.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+        m_propInstances.push_back({ model, PropType::StoneSanctuary });
+
+        const float guardX = islandX - 2.3f;
+        const float guardZ = islandZ + 1.6f;
+        glm::mat4 treeModel(1.0f);
+        treeModel = glm::translate(treeModel, glm::vec3(guardX, Mesh::sampleTerrainHeight(guardX, guardZ) - 0.12f, guardZ));
+        treeModel = glm::rotate(treeModel, glm::radians(40.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+        treeModel = glm::scale(treeModel, glm::vec3(0.95f));
+        m_propInstances.push_back({ treeModel, PropType::GoldTree });
+
+        const std::array<glm::vec2, 3> islandReeds = {{
+            { -0.9f, -2.8f },
+            {  4.1f, -0.4f },
+            {  2.6f,  1.4f }
+        }};
+        for (size_t i = 0; i < islandReeds.size(); ++i) {
+            const float rx = islandReeds[i].x;
+            const float rz = islandReeds[i].y;
+            glm::mat4 reedModel(1.0f);
+            reedModel = glm::translate(reedModel, glm::vec3(rx, Mesh::sampleTerrainHeight(rx, rz) - 0.08f, rz));
+            reedModel = glm::rotate(reedModel, glm::radians(static_cast<float>(i) * 75.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+            m_propInstances.push_back({ reedModel, PropType::ShoreBush });
+        }
+    }
+
+    // 2. Landmark: Sunken Processional Pillars & Submerged Ruins in the Lake
+    struct SunkenPillarSpec {
+        float x;
+        float z;
+        float yawDeg;
+        float pitchDeg;
+        float rollDeg;
+        float scale;
+    };
+    const std::array<SunkenPillarSpec, 10> lakePillars = {{
+        // Causeway approach from outer shore (-12, 8) across shoal (-8.5, 5.5) toward island (1.5, -1.0)
+        { -11.8f,  7.8f,  18.0f,  5.0f, -4.0f, 1.22f },
+        {  -9.6f,  6.2f,  62.0f, -7.0f,  6.0f, 1.28f },
+        {  -7.1f,  4.4f, 115.0f,  4.0f,  9.0f, 1.32f },
+        {  -4.6f,  2.4f, 205.0f, -9.0f, -5.0f, 1.38f },
+        // Sunken colonnade ring around the sanctuary island (~7.8m radius)
+        {   8.6f, -3.5f,  35.0f,  8.0f, -6.0f, 1.34f },
+        {   5.2f, -8.2f, 145.0f, -6.0f,  7.0f, 1.40f },
+        {  -3.8f, -7.2f, 240.0f, 11.0f,  4.0f, 1.36f },
+        {  -6.4f, -1.4f, 305.0f, -5.0f, -8.0f, 1.30f },
+        {   3.8f,  6.5f,  85.0f,  6.0f, 10.0f, 1.42f },
+        {   8.8f,  3.2f, 190.0f, -8.0f,  5.0f, 1.26f }
+    }};
+
+    for (const auto& spec : lakePillars) {
+        const float terrainY = Mesh::sampleTerrainHeight(spec.x, spec.z);
+        const float baseY = (std::max)(terrainY - 0.10f, -1.35f);
+        glm::mat4 model(1.0f);
+        model = glm::translate(model, glm::vec3(spec.x, baseY, spec.z));
+        model = glm::rotate(model, glm::radians(spec.yawDeg), glm::vec3(0.0f, 1.0f, 0.0f));
+        model = glm::rotate(model, glm::radians(spec.pitchDeg), glm::vec3(1.0f, 0.0f, 0.0f));
+        model = glm::rotate(model, glm::radians(spec.rollDeg), glm::vec3(0.0f, 0.0f, 1.0f));
+        model = glm::scale(model, glm::vec3(spec.scale));
+        m_propInstances.push_back({ model, PropType::RuinedPillar });
+    }
+
+    // Half-submerged mossy boulders on the shallow ruin shoal
+    const std::array<glm::vec3, 3> shoalRocks = {{
+        { -8.5f, 5.5f, 1.35f },
+        { -5.2f, 2.8f, 1.15f },
+        {  6.2f, 4.9f, 1.25f }
+    }};
+    for (size_t i = 0; i < shoalRocks.size(); ++i) {
+        const float rx = shoalRocks[i].x;
+        const float rz = shoalRocks[i].y;
+        const float rScale = shoalRocks[i].z;
+        const float ry = (std::max)(Mesh::sampleTerrainHeight(rx, rz) - 0.12f, waterLevel - 0.55f);
+        glm::mat4 model(1.0f);
+        model = glm::translate(model, glm::vec3(rx, ry, rz));
+        model = glm::rotate(model, glm::radians(static_cast<float>(i) * 110.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+        model = glm::scale(model, glm::vec3(rScale, rScale * 0.85f, rScale));
+        m_propInstances.push_back({ model, PropType::Rock });
+    }
+
+    // Secondary lakeside overlook sanctuary ruin
+    {
+        const float overlookY = Mesh::sampleTerrainHeight(overlookX, overlookZ);
+        glm::mat4 model(1.0f);
+        model = glm::translate(model, glm::vec3(overlookX, overlookY - 0.14f, overlookZ));
+        model = glm::rotate(model, glm::radians(-130.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+        model = glm::scale(model, glm::vec3(0.78f));
+        m_propInstances.push_back({ model, PropType::StoneSanctuary });
+    }
+
+    // 3. Biome-driven scattering across Shoreline, Forest/Meadow & Alpine zones
+    std::mt19937 rng(2026);
+    std::uniform_real_distribution<float> jitterDist(-1.15f, 1.15f);
+    std::uniform_real_distribution<float> yawDist(0.0f, 360.0f);
+    std::uniform_real_distribution<float> tiltDist(-7.0f, 7.0f);
+    std::uniform_real_distribution<float> treeScaleDist(0.85f, 1.45f);
+    std::uniform_real_distribution<float> bushScaleDist(0.65f, 1.20f);
+    std::uniform_real_distribution<float> rockScaleDist(0.65f, 1.65f);
+    std::uniform_real_distribution<float> chanceDist(0.0f, 1.0f);
+    std::uniform_real_distribution<float> speciesDist(0.0f, 1.0f);
+
+    for (float gx = -38.0f; gx <= 38.0f; gx += 3.6f) {
+        for (float gz = -38.0f; gz <= 38.0f; gz += 3.6f) {
             const float x = gx + jitterDist(rng);
             const float z = gz + jitterDist(rng);
-            const float y = Mesh::sampleTerrainHeight(x, z);
 
+            const float dxIso = x - islandX;
+            const float dzIso = z - islandZ;
+            if ((dxIso * dxIso + dzIso * dzIso) < (4.5f * 4.5f)) {
+                continue;
+            }
+
+            const float dxOver = x - overlookX;
+            const float dzOver = z - overlookZ;
+            if ((dxOver * dxOver + dzOver * dzOver) < (3.5f * 3.5f)) {
+                continue;
+            }
+
+            const float y = Mesh::sampleTerrainHeight(x, z);
             const float roll = chanceDist(rng);
-            if (y >= 0.75f && y <= 5.6f && roll < 0.46f) {
-                const float scale = treeScaleDist(rng);
-                glm::mat4 model(1.0f);
-                model = glm::translate(model, glm::vec3(x, y - 0.10f, z));
-                model = glm::rotate(model, glm::radians(yawDist(rng)), glm::vec3(0.0f, 1.0f, 0.0f));
-                model = glm::scale(model, glm::vec3(scale));
-                m_propInstances.push_back({ model, true });
-            } else if (y >= 0.15f && y <= 8.5f && roll >= 0.46f && roll < 0.66f) {
-                const float scale = rockScaleDist(rng);
-                glm::mat4 model(1.0f);
-                model = glm::translate(model, glm::vec3(x, y - 0.05f, z));
-                model = glm::rotate(model, glm::radians(yawDist(rng)), glm::vec3(0.0f, 1.0f, 0.0f));
-                model = glm::scale(model, glm::vec3(scale, scale * 0.8f, scale));
-                m_propInstances.push_back({ model, false });
+
+            if (y >= -0.20f && y < 0.85f) {
+                // Shoreline & Marsh Zone
+                if (roll < 0.45f) {
+                    const float scale = bushScaleDist(rng);
+                    glm::mat4 model(1.0f);
+                    model = glm::translate(model, glm::vec3(x, y - 0.06f, z));
+                    model = glm::rotate(model, glm::radians(yawDist(rng)), glm::vec3(0.0f, 1.0f, 0.0f));
+                    model = glm::scale(model, glm::vec3(scale));
+                    m_propInstances.push_back({ model, PropType::ShoreBush });
+                } else if (roll < 0.62f) {
+                    const float scale = rockScaleDist(rng) * 0.72f;
+                    glm::mat4 model(1.0f);
+                    model = glm::translate(model, glm::vec3(x, y - 0.06f, z));
+                    model = glm::rotate(model, glm::radians(yawDist(rng)), glm::vec3(0.0f, 1.0f, 0.0f));
+                    model = glm::scale(model, glm::vec3(scale, scale * 0.8f, scale));
+                    m_propInstances.push_back({ model, PropType::Rock });
+                } else if (roll < 0.70f && y > 0.35f) {
+                    const float scale = treeScaleDist(rng) * 0.85f;
+                    glm::mat4 model(1.0f);
+                    model = glm::translate(model, glm::vec3(x, y - 0.10f, z));
+                    model = glm::rotate(model, glm::radians(yawDist(rng)), glm::vec3(0.0f, 1.0f, 0.0f));
+                    model = glm::scale(model, glm::vec3(scale));
+                    m_propInstances.push_back({ model, PropType::GoldTree });
+                }
+            } else if (y >= 0.85f && y <= 5.8f) {
+                // Forest & Meadow Zone
+                const float biomeWave = std::sin(x * 0.08f) + std::cos(z * 0.08f);
+                if (roll < 0.48f) {
+                    const float speciesRoll = speciesDist(rng);
+                    PropType treeType = PropType::PineTree;
+                    if (biomeWave > 0.45f) {
+                        if (speciesRoll < 0.55f) {
+                            treeType = PropType::GoldTree;
+                        } else if (speciesRoll < 0.85f) {
+                            treeType = PropType::CrimsonTree;
+                        } else {
+                            treeType = PropType::PineTree;
+                        }
+                    } else if (biomeWave < -0.35f) {
+                        treeType = (speciesRoll < 0.80f) ? PropType::PineTree : PropType::GoldTree;
+                    } else {
+                        if (speciesRoll < 0.50f) {
+                            treeType = PropType::PineTree;
+                        } else if (speciesRoll < 0.78f) {
+                            treeType = PropType::GoldTree;
+                        } else {
+                            treeType = PropType::CrimsonTree;
+                        }
+                    }
+
+                    const float scale = treeScaleDist(rng);
+                    glm::mat4 model(1.0f);
+                    model = glm::translate(model, glm::vec3(x, y - 0.10f, z));
+                    model = glm::rotate(model, glm::radians(yawDist(rng)), glm::vec3(0.0f, 1.0f, 0.0f));
+                    model = glm::scale(model, glm::vec3(scale));
+                    m_propInstances.push_back({ model, treeType });
+                } else if (roll < 0.64f) {
+                    const float scale = bushScaleDist(rng) * 0.90f;
+                    glm::mat4 model(1.0f);
+                    model = glm::translate(model, glm::vec3(x, y - 0.06f, z));
+                    model = glm::rotate(model, glm::radians(yawDist(rng)), glm::vec3(0.0f, 1.0f, 0.0f));
+                    model = glm::scale(model, glm::vec3(scale));
+                    m_propInstances.push_back({ model, PropType::ShoreBush });
+                } else if (roll < 0.76f) {
+                    const float scale = rockScaleDist(rng);
+                    glm::mat4 model(1.0f);
+                    model = glm::translate(model, glm::vec3(x, y - 0.06f, z));
+                    model = glm::rotate(model, glm::radians(yawDist(rng)), glm::vec3(0.0f, 1.0f, 0.0f));
+                    model = glm::scale(model, glm::vec3(scale, scale * 0.8f, scale));
+                    m_propInstances.push_back({ model, PropType::Rock });
+                }
+            } else if (y > 5.8f && y <= 9.5f) {
+                // Alpine Crags & Ridges
+                if (roll < 0.30f) {
+                    const float scale = rockScaleDist(rng) * 1.15f;
+                    glm::mat4 model(1.0f);
+                    model = glm::translate(model, glm::vec3(x, y - 0.08f, z));
+                    model = glm::rotate(model, glm::radians(yawDist(rng)), glm::vec3(0.0f, 1.0f, 0.0f));
+                    model = glm::scale(model, glm::vec3(scale, scale * 0.85f, scale));
+                    m_propInstances.push_back({ model, PropType::Rock });
+                } else if (roll < 0.46f) {
+                    const float scale = treeScaleDist(rng) * 0.80f;
+                    glm::mat4 model(1.0f);
+                    model = glm::translate(model, glm::vec3(x, y - 0.10f, z));
+                    model = glm::rotate(model, glm::radians(yawDist(rng)), glm::vec3(0.0f, 1.0f, 0.0f));
+                    model = glm::scale(model, glm::vec3(scale));
+                    m_propInstances.push_back({ model, PropType::PineTree });
+                } else if (roll < 0.50f) {
+                    const float scale = 0.90f + chanceDist(rng) * 0.35f;
+                    glm::mat4 model(1.0f);
+                    model = glm::translate(model, glm::vec3(x, y - 0.14f, z));
+                    model = glm::rotate(model, glm::radians(yawDist(rng)), glm::vec3(0.0f, 1.0f, 0.0f));
+                    model = glm::rotate(model, glm::radians(tiltDist(rng)), glm::vec3(1.0f, 0.0f, 0.0f));
+                    model = glm::scale(model, glm::vec3(scale));
+                    m_propInstances.push_back({ model, PropType::RuinedPillar });
+                }
             }
         }
     }
@@ -859,13 +1096,7 @@ void Renderer::renderFrame() {
                 sizeof(PushConstants),
                 &pc
             );
-            if (prop.isTree) {
-                m_treeMesh.bindAndDraw(cmd);
-                frameTriangles += m_treeMesh.getTriangleCount();
-            } else {
-                m_rockMesh.bindAndDraw(cmd);
-                frameTriangles += m_rockMesh.getTriangleCount();
-            }
+            frameTriangles += drawPropMesh(cmd, prop.type);
             ++frameDrawCalls;
         }
 
@@ -1068,13 +1299,7 @@ void Renderer::renderFrame() {
                 sizeof(PushConstants),
                 &pc
             );
-            if (prop.isTree) {
-                m_treeMesh.bindAndDraw(cmd);
-                frameTriangles += m_treeMesh.getTriangleCount();
-            } else {
-                m_rockMesh.bindAndDraw(cmd);
-                frameTriangles += m_rockMesh.getTriangleCount();
-            }
+            frameTriangles += drawPropMesh(cmd, prop.type);
             ++frameDrawCalls;
         }
 

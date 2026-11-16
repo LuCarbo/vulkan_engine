@@ -87,6 +87,29 @@ public:
         std::string_view objPath,
         const glm::vec3& defaultColor = {0.8f, 0.8f, 0.8f});
 
+    /**
+     * @brief Generates a multi-part low-poly stone sanctuary ruin (plinth, columns, lintel archway, and rune obelisk).
+     */
+    [[nodiscard]] static Mesh createStoneRuins(const Context& context);
+
+    /**
+     * @brief Generates a weathered/mossy stone column & rubble fragment for submerged lake ruins and hillside markers.
+     */
+    [[nodiscard]] static Mesh createRuinedPillar(const Context& context);
+
+    /**
+     * @brief Generates a stylized low-poly broadleaf/autumn tree with a multi-cluster faceted canopy.
+     */
+    [[nodiscard]] static Mesh createBroadleafTree(
+        const Context& context,
+        const glm::vec3& canopyColor,
+        const char* debugName = "Broadleaf Tree Mesh");
+
+    /**
+     * @brief Generates a low-poly shoreline bush and cattail reed cluster.
+     */
+    [[nodiscard]] static Mesh createBushAndReeds(const Context& context);
+
 private:
     Buffer m_vertexBuffer;
     Buffer m_indexBuffer;
