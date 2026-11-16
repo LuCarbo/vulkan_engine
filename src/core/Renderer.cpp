@@ -1,0 +1,1082 @@
+#include "core/Renderer.hpp"
+#include "core/Context.hpp"
+#include "core/Window.hpp"
+#include "core/Swapchain.hpp"
+#include "core/DebugUtils.hpp"
+
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <random>
+#include <stdexcept>
+#include <string>
+
+Renderer::Renderer(const Context& context, Window& window, Swapchain& swapchain, const Pipeline& pipeline)
+    : m_context(context), m_window(window), m_swapchain(swapchain), m_pipeline(pipeline) {
+    createCommandPool();
+    createCommandBuffers();
+    createSyncObjects();
+    createQueryPools();
+    createShadowResources();
+    createSceneResources();
+
+    m_imguiLayer = std::make_unique<ImGuiLayer>(
+        m_context,
+        m_window,
+        m_swapchain.getImageFormat(),
+        m_swapchain.getDepthFormat(),
+        static_cast<uint32_t>(m_swapchain.getImageCount())
+    );
+
+    const auto& props = m_context.getDeviceProperties();
+    m_inspectorState.deviceName = props.deviceName;
+    m_inspectorState.apiVersion = props.apiVersion;
+    m_inspectorState.pushDescriptorsEnabled = m_context.hasPushDescriptors();
+    m_inspectorState.wireframeSupported = m_context.hasNonSolidFill();
+
+    m_startTime = std::chrono::steady_clock::now();
+    m_lastFrameTime = m_startTime;
+
+    std::cout << "[OK] Renderer 3D Low-Poly inizializzato (Frames in Flight: " << MAX_FRAMES_IN_FLIGHT
+              << ", Shadow Map: " << SHADOW_MAP_DIM << "x" << SHADOW_MAP_DIM
+              << ", ImGui Dynamic Rendering)." << std::endl;
+    std::cout << "[CONTROLLI] 1-4: Debug View | F: Wireframe | C: Orbit/Fly | WASD+RMB: Muovi Camera" << std::endl;
+}
+
+Renderer::~Renderer() {
+    m_context.waitIdle();
+
+    if (m_imguiLayer) {
+        m_imguiLayer->cleanup();
+        m_imguiLayer.reset();
+    }
+
+    m_rockMesh.cleanup();
+    m_treeMesh.cleanup();
+    m_waterMesh.cleanup();
+    m_terrainMesh.cleanup();
+    m_skyDomeMesh.cleanup();
+
+    for (auto& ubo : m_uboBuffers) {
+        ubo.cleanup();
+    }
+
+    m_shadowPipeline.cleanup();
+    if (m_shadowSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(m_context.getDevice(), m_shadowSampler, nullptr);
+        m_shadowSampler = VK_NULL_HANDLE;
+    }
+    m_shadowMapImage.cleanup();
+
+    if (m_fallbackDescriptorPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(m_context.getDevice(), m_fallbackDescriptorPool, nullptr);
+        m_fallbackDescriptorPool = VK_NULL_HANDLE;
+    }
+
+    destroyQueryPools();
+    cleanupSyncObjects();
+
+    if (m_commandPool != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(m_context.getDevice(), m_commandPool, nullptr);
+        m_commandPool = VK_NULL_HANDLE;
+    }
+
+    std::cout << "[INFO] Renderer deallocato correttamente." << std::endl;
+}
+
+void Renderer::createCommandPool() {
+    auto queueFamilies = m_context.getQueueFamilies();
+
+    VkCommandPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = queueFamilies.graphicsFamily.value();
+
+    if (vkCreateCommandPool(m_context.getDevice(), &poolInfo, nullptr, &m_commandPool) != VK_SUCCESS) {
+        throw std::runtime_error("Impossibile creare il Command Pool!");
+    }
+
+    DebugUtils::setObjectName(m_context.getDevice(), VK_OBJECT_TYPE_COMMAND_POOL, m_commandPool, "Renderer Command Pool");
+}
+
+void Renderer::createCommandBuffers() {
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = m_commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = MAX_FRAMES_IN_FLIGHT;
+
+    if (vkAllocateCommandBuffers(m_context.getDevice(), &allocInfo, m_commandBuffers.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Impossibile allocare i Command Buffer!");
+    }
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        const std::string cmdName = "Frame Command Buffer " + std::to_string(i);
+        DebugUtils::setObjectName(m_context.getDevice(), VK_OBJECT_TYPE_COMMAND_BUFFER, m_commandBuffers[i], cmdName.c_str());
+    }
+}
+
+void Renderer::createSyncObjects() {
+    VkSemaphoreCreateInfo semaphoreInfo{};
+    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (vkCreateSemaphore(m_context.getDevice(), &semaphoreInfo, nullptr, &m_imageAvailableSemaphores[i]) != VK_SUCCESS ||
+            vkCreateFence(m_context.getDevice(), &fenceInfo, nullptr, &m_inFlightFences[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Impossibile creare gli oggetti di sincronizzazione per i frame in volo!");
+        }
+
+        const std::string semName = "ImageAvailable Semaphore " + std::to_string(i);
+        const std::string fenceName = "InFlight Fence " + std::to_string(i);
+        DebugUtils::setObjectName(m_context.getDevice(), VK_OBJECT_TYPE_SEMAPHORE, m_imageAvailableSemaphores[i], semName.c_str());
+        DebugUtils::setObjectName(m_context.getDevice(), VK_OBJECT_TYPE_FENCE, m_inFlightFences[i], fenceName.c_str());
+    }
+
+    m_renderFinishedSemaphores.resize(m_swapchain.getImageCount());
+    for (size_t i = 0; i < m_swapchain.getImageCount(); ++i) {
+        if (vkCreateSemaphore(m_context.getDevice(), &semaphoreInfo, nullptr, &m_renderFinishedSemaphores[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Impossibile creare i semafori renderFinished!");
+        }
+        const std::string semName = "RenderFinished Semaphore " + std::to_string(i);
+        DebugUtils::setObjectName(m_context.getDevice(), VK_OBJECT_TYPE_SEMAPHORE, m_renderFinishedSemaphores[i], semName.c_str());
+    }
+}
+
+void Renderer::createQueryPools() {
+    if (m_context.getDeviceProperties().limits.timestampPeriod <= 0.0f) {
+        return;
+    }
+
+    VkQueryPoolCreateInfo queryPoolInfo{};
+    queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    queryPoolInfo.queryCount = QUERY_COUNT_PER_FRAME;
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (vkCreateQueryPool(m_context.getDevice(), &queryPoolInfo, nullptr, &m_timestampQueryPools[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Impossibile creare il VkQueryPool per i timestamp GPU!");
+        }
+        const std::string poolName = "GPU Timestamp QueryPool " + std::to_string(i);
+        DebugUtils::setObjectName(m_context.getDevice(), VK_OBJECT_TYPE_QUERY_POOL, m_timestampQueryPools[i], poolName.c_str());
+        m_queryPoolHasData[i] = false;
+    }
+}
+
+void Renderer::destroyQueryPools() noexcept {
+    VkDevice device = m_context.getDevice();
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (m_timestampQueryPools[i] != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(device, m_timestampQueryPools[i], nullptr);
+            m_timestampQueryPools[i] = VK_NULL_HANDLE;
+        }
+        m_queryPoolHasData[i] = false;
+    }
+}
+
+void Renderer::createShadowResources() {
+    m_shadowMapImage = Image(
+        m_context,
+        { SHADOW_MAP_DIM, SHADOW_MAP_DIM },
+        VK_FORMAT_D32_SFLOAT,
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_ASPECT_DEPTH_BIT,
+        "Directional Shadow Map"
+    );
+
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.mipLodBias = 0.0f;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.compareEnable = VK_TRUE;
+    samplerInfo.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 0.0f;
+    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+
+    if (vkCreateSampler(m_context.getDevice(), &samplerInfo, nullptr, &m_shadowSampler) != VK_SUCCESS) {
+        throw std::runtime_error("Impossibile creare il Shadow Map Comparison Sampler!");
+    }
+
+    DebugUtils::setObjectName(
+        m_context.getDevice(),
+        VK_OBJECT_TYPE_SAMPLER,
+        m_shadowSampler,
+        "Shadow Map Comparison Sampler"
+    );
+
+    PipelineConfig shadowConfig{};
+    shadowConfig.enableVertexInput = true;
+    shadowConfig.enableDepthTest = true;
+    shadowConfig.enableDepthWrite = true;
+    shadowConfig.enableWireframeVariant = false;
+    shadowConfig.enableDepthBias = true;
+    shadowConfig.depthBiasConstantFactor = 1.25f;
+    shadowConfig.depthBiasSlopeFactor = 1.75f;
+    shadowConfig.includeShadowSamplerBinding = false;
+    shadowConfig.cullMode = VK_CULL_MODE_BACK_BIT;
+    shadowConfig.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    shadowConfig.depthCompareOp = VK_COMPARE_OP_LESS;
+    shadowConfig.debugName = "Shadow Depth Pipeline";
+
+    m_shadowPipeline = Pipeline(
+        m_context,
+        VK_FORMAT_UNDEFINED,
+        VK_FORMAT_D32_SFLOAT,
+        "shaders/shadow.vert.spv",
+        "",
+        shadowConfig
+    );
+}
+
+void Renderer::createSceneResources() {
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        const std::string uboName = "Frame UBO Buffer " + std::to_string(i);
+        m_uboBuffers[i] = Buffer(
+            m_context,
+            sizeof(FrameUBO),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VMA_MEMORY_USAGE_AUTO,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+            uboName.c_str()
+        );
+    }
+
+    if (!m_context.hasPushDescriptors()) {
+        std::array<VkDescriptorPoolSize, 2> poolSizes{};
+        poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSizes[0].descriptorCount = MAX_FRAMES_IN_FLIGHT * 2;
+        poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSizes[1].descriptorCount = MAX_FRAMES_IN_FLIGHT;
+
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        poolInfo.pPoolSizes = poolSizes.data();
+        poolInfo.maxSets = MAX_FRAMES_IN_FLIGHT * 2;
+
+        if (vkCreateDescriptorPool(m_context.getDevice(), &poolInfo, nullptr, &m_fallbackDescriptorPool) != VK_SUCCESS) {
+            throw std::runtime_error("Impossibile creare il Descriptor Pool di fallback!");
+        }
+
+        std::array<VkDescriptorSetLayout, MAX_FRAMES_IN_FLIGHT> mainLayouts{};
+        mainLayouts.fill(m_pipeline.getDescriptorSetLayout());
+
+        VkDescriptorSetAllocateInfo mainAllocInfo{};
+        mainAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        mainAllocInfo.descriptorPool = m_fallbackDescriptorPool;
+        mainAllocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
+        mainAllocInfo.pSetLayouts = mainLayouts.data();
+
+        if (vkAllocateDescriptorSets(m_context.getDevice(), &mainAllocInfo, m_fallbackDescriptorSets.data()) != VK_SUCCESS) {
+            throw std::runtime_error("Impossibile allocare i Descriptor Set principali di fallback!");
+        }
+
+        std::array<VkDescriptorSetLayout, MAX_FRAMES_IN_FLIGHT> shadowLayouts{};
+        shadowLayouts.fill(m_shadowPipeline.getDescriptorSetLayout());
+
+        VkDescriptorSetAllocateInfo shadowAllocInfo{};
+        shadowAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        shadowAllocInfo.descriptorPool = m_fallbackDescriptorPool;
+        shadowAllocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
+        shadowAllocInfo.pSetLayouts = shadowLayouts.data();
+
+        if (vkAllocateDescriptorSets(m_context.getDevice(), &shadowAllocInfo, m_fallbackShadowDescriptorSets.data()) != VK_SUCCESS) {
+            throw std::runtime_error("Impossibile allocare i Descriptor Set Shadow di fallback!");
+        }
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+            VkDescriptorBufferInfo bufferInfo{};
+            bufferInfo.buffer = m_uboBuffers[i].getHandle();
+            bufferInfo.offset = 0;
+            bufferInfo.range = sizeof(FrameUBO);
+
+            VkDescriptorImageInfo imageInfo{};
+            imageInfo.sampler = m_shadowSampler;
+            imageInfo.imageView = m_shadowMapImage.getView();
+            imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            std::array<VkWriteDescriptorSet, 3> writes{};
+            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[0].dstSet = m_fallbackDescriptorSets[i];
+            writes[0].dstBinding = 0;
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writes[0].descriptorCount = 1;
+            writes[0].pBufferInfo = &bufferInfo;
+
+            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[1].dstSet = m_fallbackDescriptorSets[i];
+            writes[1].dstBinding = 1;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[1].descriptorCount = 1;
+            writes[1].pImageInfo = &imageInfo;
+
+            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[2].dstSet = m_fallbackShadowDescriptorSets[i];
+            writes[2].dstBinding = 0;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writes[2].descriptorCount = 1;
+            writes[2].pBufferInfo = &bufferInfo;
+
+            vkUpdateDescriptorSets(m_context.getDevice(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        }
+    }
+
+    m_skyDomeMesh = Mesh::createSkyDome(m_context, 350.0f);
+    m_terrainMesh = Mesh::createTerrain(m_context, 120, 90.0f);
+    m_waterMesh = Mesh::createWaterPlane(m_context, 90, 90.0f, -0.25f);
+    m_treeMesh = Mesh::loadFromObj(m_context, "assets/pine_tree.obj", { 0.14f, 0.45f, 0.20f });
+    m_rockMesh = Mesh::loadFromObj(m_context, "assets/rock.obj", { 0.50f, 0.49f, 0.46f });
+
+    populateProps();
+}
+
+void Renderer::populateProps() {
+    m_propInstances.clear();
+
+    std::mt19937 rng(2026);
+    std::uniform_real_distribution<float> jitterDist(-1.2f, 1.2f);
+    std::uniform_real_distribution<float> yawDist(0.0f, 360.0f);
+    std::uniform_real_distribution<float> treeScaleDist(0.85f, 1.45f);
+    std::uniform_real_distribution<float> rockScaleDist(0.65f, 1.55f);
+    std::uniform_real_distribution<float> chanceDist(0.0f, 1.0f);
+
+    for (float gx = -38.0f; gx <= 38.0f; gx += 4.2f) {
+        for (float gz = -38.0f; gz <= 38.0f; gz += 4.2f) {
+            const float x = gx + jitterDist(rng);
+            const float z = gz + jitterDist(rng);
+            const float y = Mesh::sampleTerrainHeight(x, z);
+
+            const float roll = chanceDist(rng);
+            if (y >= 0.75f && y <= 5.6f && roll < 0.46f) {
+                const float scale = treeScaleDist(rng);
+                glm::mat4 model(1.0f);
+                model = glm::translate(model, glm::vec3(x, y - 0.10f, z));
+                model = glm::rotate(model, glm::radians(yawDist(rng)), glm::vec3(0.0f, 1.0f, 0.0f));
+                model = glm::scale(model, glm::vec3(scale));
+                m_propInstances.push_back({ model, true });
+            } else if (y >= 0.15f && y <= 8.5f && roll >= 0.46f && roll < 0.66f) {
+                const float scale = rockScaleDist(rng);
+                glm::mat4 model(1.0f);
+                model = glm::translate(model, glm::vec3(x, y - 0.05f, z));
+                model = glm::rotate(model, glm::radians(yawDist(rng)), glm::vec3(0.0f, 1.0f, 0.0f));
+                model = glm::scale(model, glm::vec3(scale, scale * 0.8f, scale));
+                m_propInstances.push_back({ model, false });
+            }
+        }
+    }
+}
+
+void Renderer::processInput() {
+    GLFWwindow* handle = m_window.getHandle();
+    if (handle == nullptr) {
+        return;
+    }
+
+    if (m_imguiLayer && m_imguiLayer->wantsCaptureKeyboard()) {
+        m_keyFPressed = (glfwGetKey(handle, GLFW_KEY_F) == GLFW_PRESS);
+        m_keyCPressed = (glfwGetKey(handle, GLFW_KEY_C) == GLFW_PRESS);
+        return;
+    }
+
+    if (glfwGetKey(handle, GLFW_KEY_1) == GLFW_PRESS) m_inspectorState.debugView = 0;
+    if (glfwGetKey(handle, GLFW_KEY_2) == GLFW_PRESS) m_inspectorState.debugView = 1;
+    if (glfwGetKey(handle, GLFW_KEY_3) == GLFW_PRESS) m_inspectorState.debugView = 2;
+    if (glfwGetKey(handle, GLFW_KEY_4) == GLFW_PRESS) m_inspectorState.debugView = 3;
+
+    const bool fPressed = (glfwGetKey(handle, GLFW_KEY_F) == GLFW_PRESS);
+    if (fPressed && !m_keyFPressed && m_context.hasNonSolidFill()) {
+        m_inspectorState.wireframe = !m_inspectorState.wireframe;
+    }
+    m_keyFPressed = fPressed;
+
+    const bool cPressed = (glfwGetKey(handle, GLFW_KEY_C) == GLFW_PRESS);
+    if (cPressed && !m_keyCPressed) {
+        m_camera.toggleMode();
+        m_inspectorState.cameraMode = m_camera.getMode();
+    }
+    m_keyCPressed = cPressed;
+}
+
+void Renderer::readTimestampQueries(uint32_t frameIndex) {
+    if (m_timestampQueryPools[frameIndex] == VK_NULL_HANDLE || !m_queryPoolHasData[frameIndex]) {
+        return;
+    }
+
+    std::array<uint64_t, QUERY_COUNT_PER_FRAME> timestamps{};
+    const VkResult res = vkGetQueryPoolResults(
+        m_context.getDevice(),
+        m_timestampQueryPools[frameIndex],
+        0,
+        QUERY_COUNT_PER_FRAME,
+        sizeof(timestamps),
+        timestamps.data(),
+        sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT
+    );
+
+    if (res == VK_SUCCESS) {
+        const float periodNs = m_context.getDeviceProperties().limits.timestampPeriod;
+        if (periodNs > 0.0f) {
+            if (timestamps[1] >= timestamps[0]) {
+                m_shadowPassMs = static_cast<float>(timestamps[1] - timestamps[0]) * periodNs * 1e-6f;
+            }
+            if (timestamps[3] >= timestamps[2]) {
+                m_mainPassMs = static_cast<float>(timestamps[3] - timestamps[2]) * periodNs * 1e-6f;
+            }
+            if (timestamps[3] >= timestamps[0]) {
+                m_gpuFrameMs = static_cast<float>(timestamps[3] - timestamps[0]) * periodNs * 1e-6f;
+            }
+        }
+    }
+}
+
+void Renderer::updateVmaStats() {
+    VmaTotalStatistics stats{};
+    vmaCalculateStatistics(m_context.getAllocator(), &stats);
+
+    const VkPhysicalDeviceMemoryProperties* memProps = nullptr;
+    vmaGetMemoryProperties(m_context.getAllocator(), &memProps);
+
+    VkDeviceSize deviceLocalBytes = 0;
+    uint32_t deviceLocalAllocs = 0;
+    VkDeviceSize hostVisibleBytes = 0;
+    uint32_t hostVisibleAllocs = 0;
+
+    if (memProps != nullptr) {
+        for (uint32_t i = 0; i < memProps->memoryTypeCount; ++i) {
+            const VkMemoryPropertyFlags flags = memProps->memoryTypes[i].propertyFlags;
+            const auto& typeStats = stats.memoryType[i].statistics;
+
+            if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+                deviceLocalBytes += typeStats.allocationBytes;
+                deviceLocalAllocs += typeStats.allocationCount;
+            } else if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+                hostVisibleBytes += typeStats.allocationBytes;
+                hostVisibleAllocs += typeStats.allocationCount;
+            }
+        }
+    }
+
+    constexpr float bytesToMB = 1.0f / (1024.0f * 1024.0f);
+    m_inspectorState.deviceLocalMB = static_cast<float>(deviceLocalBytes) * bytesToMB;
+    m_inspectorState.deviceLocalAllocations = deviceLocalAllocs;
+    m_inspectorState.hostVisibleMB = static_cast<float>(hostVisibleBytes) * bytesToMB;
+    m_inspectorState.hostVisibleAllocations = hostVisibleAllocs;
+    m_inspectorState.totalReservedBlockMB = static_cast<float>(stats.total.statistics.blockBytes) * bytesToMB;
+    m_inspectorState.totalBlocks = stats.total.statistics.blockCount;
+}
+
+void Renderer::updateInspectorState(float deltaTime) {
+    const float clampedDt = std::max(deltaTime, 0.0001f);
+    const float instantFps = 1.0f / clampedDt;
+    const float instantCpuMs = clampedDt * 1000.0f;
+
+    if (m_fpsSmoothed <= 0.0f) {
+        m_fpsSmoothed = instantFps;
+        m_cpuFrameMsSmoothed = instantCpuMs;
+    } else {
+        m_fpsSmoothed = m_fpsSmoothed * 0.92f + instantFps * 0.08f;
+        m_cpuFrameMsSmoothed = m_cpuFrameMsSmoothed * 0.92f + instantCpuMs * 0.08f;
+    }
+
+    const VkExtent2D extent = m_swapchain.getExtent();
+    m_inspectorState.presentModeName = m_swapchain.getPresentModeName();
+    m_inspectorState.swapchainWidth = extent.width;
+    m_inspectorState.swapchainHeight = extent.height;
+    m_inspectorState.fps = m_fpsSmoothed;
+    m_inspectorState.cpuFrameMs = m_cpuFrameMsSmoothed;
+    m_inspectorState.gpuFrameMs = m_gpuFrameMs;
+    m_inspectorState.shadowPassMs = m_shadowPassMs;
+    m_inspectorState.mainPassMs = m_mainPassMs;
+    m_inspectorState.drawCalls = m_lastDrawCalls;
+    m_inspectorState.renderedTriangles = m_lastRenderedTriangles;
+    m_inspectorState.cameraMode = m_camera.getMode();
+
+    updateVmaStats();
+}
+
+void Renderer::updateFrameUBO(float elapsedTime) {
+    const VkExtent2D extent = m_swapchain.getExtent();
+    const float aspectRatio = static_cast<float>(extent.width) /
+                              static_cast<float>(std::max(extent.height, 1u));
+
+    const float elevRad = glm::radians(m_inspectorState.sunElevationDeg);
+    const float azimRad = glm::radians(m_inspectorState.sunAzimuthDeg);
+    const glm::vec3 sunDir = glm::normalize(glm::vec3(
+        std::cos(elevRad) * std::cos(azimRad),
+        std::sin(elevRad),
+        std::cos(elevRad) * std::sin(azimRad)
+    ));
+
+    const glm::vec3 lightPos = sunDir * 85.0f;
+    const glm::mat4 lightView = glm::lookAt(
+        lightPos,
+        glm::vec3(0.0f, 1.5f, 0.0f),
+        glm::vec3(0.0f, 1.0f, 0.0f)
+    );
+    glm::mat4 lightProj = glm::ortho(-55.0f, 55.0f, -55.0f, 55.0f, 10.0f, 175.0f);
+    lightProj[1][1] *= -1.0f;
+
+    FrameUBO ubo{};
+    ubo.view = m_camera.getViewMatrix();
+    ubo.proj = m_camera.getProjectionMatrix(aspectRatio);
+    ubo.viewProj = ubo.proj * ubo.view;
+    ubo.lightSpaceMatrix = lightProj * lightView;
+    ubo.sunDirectionIntensity = glm::vec4(sunDir, m_inspectorState.sunIntensity);
+    ubo.sunColorAmbient = glm::vec4(1.0f, 0.95f, 0.86f, m_inspectorState.ambientStrength);
+    ubo.cameraPosTime = glm::vec4(m_camera.getPosition(), elapsedTime);
+    ubo.waterParams = glm::vec4(m_inspectorState.waterWaveSpeed, m_inspectorState.waterWaveHeight, -0.25f, 0.0f);
+
+    m_uboBuffers[m_currentFrame].upload(&ubo, sizeof(ubo), 0);
+}
+
+void Renderer::cleanupSyncObjects() {
+    VkDevice device = m_context.getDevice();
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (m_inFlightFences[i] != VK_NULL_HANDLE) {
+            vkDestroyFence(device, m_inFlightFences[i], nullptr);
+            m_inFlightFences[i] = VK_NULL_HANDLE;
+        }
+        if (m_imageAvailableSemaphores[i] != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device, m_imageAvailableSemaphores[i], nullptr);
+            m_imageAvailableSemaphores[i] = VK_NULL_HANDLE;
+        }
+    }
+
+    for (auto& semaphore : m_renderFinishedSemaphores) {
+        if (semaphore != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device, semaphore, nullptr);
+            semaphore = VK_NULL_HANDLE;
+        }
+    }
+    m_renderFinishedSemaphores.clear();
+}
+
+void Renderer::recreateSwapchain() {
+    auto [width, height] = m_window.getFramebufferSize();
+    while (width == 0 || height == 0) {
+        m_window.pollEvents();
+        auto size = m_window.getFramebufferSize();
+        width = size.first;
+        height = size.second;
+    }
+
+    m_context.waitIdle();
+    m_swapchain.recreate(m_window);
+
+    if (m_renderFinishedSemaphores.size() != m_swapchain.getImageCount()) {
+        for (auto& semaphore : m_renderFinishedSemaphores) {
+            if (semaphore != VK_NULL_HANDLE) {
+                vkDestroySemaphore(m_context.getDevice(), semaphore, nullptr);
+            }
+        }
+        m_renderFinishedSemaphores.clear();
+
+        VkSemaphoreCreateInfo semaphoreInfo{};
+        semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+        m_renderFinishedSemaphores.resize(m_swapchain.getImageCount());
+        for (size_t i = 0; i < m_swapchain.getImageCount(); ++i) {
+            if (vkCreateSemaphore(m_context.getDevice(), &semaphoreInfo, nullptr, &m_renderFinishedSemaphores[i]) != VK_SUCCESS) {
+                throw std::runtime_error("Impossibile ricreare i semafori renderFinished!");
+            }
+            const std::string semName = "RenderFinished Semaphore " + std::to_string(i);
+            DebugUtils::setObjectName(m_context.getDevice(), VK_OBJECT_TYPE_SEMAPHORE, m_renderFinishedSemaphores[i], semName.c_str());
+        }
+    }
+}
+
+void Renderer::renderFrame() {
+    const auto now = std::chrono::steady_clock::now();
+    const float deltaTime = std::chrono::duration<float>(now - m_lastFrameTime).count();
+    const float elapsedTime = std::chrono::duration<float>(now - m_startTime).count();
+    m_lastFrameTime = now;
+
+    processInput();
+    const bool uiCapturingInput = m_imguiLayer && (m_imguiLayer->wantsCaptureMouse() || m_imguiLayer->wantsCaptureKeyboard());
+    m_camera.update(uiCapturingInput ? nullptr : m_window.getHandle(), deltaTime);
+
+    VkDevice device = m_context.getDevice();
+
+    // 1. Attesa che il frame in volo precedente abbia terminato
+    vkWaitForFences(device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE, UINT64_MAX);
+    readTimestampQueries(m_currentFrame);
+
+    // 2. Acquisizione dell'immagine successiva dalla Swapchain
+    uint32_t imageIndex = 0;
+    VkResult result = m_swapchain.acquireNextImage(m_imageAvailableSemaphores[m_currentFrame], imageIndex);
+
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        recreateSwapchain();
+        return;
+    } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        throw std::runtime_error("Impossibile acquisire un'immagine dalla Swapchain!");
+    }
+
+    vkResetFences(device, 1, &m_inFlightFences[m_currentFrame]);
+
+    // Aggiorna telemetria + ImGui prima della registrazione del command buffer
+    updateInspectorState(deltaTime);
+    if (m_imguiLayer) {
+        m_imguiLayer->beginFrame();
+        m_imguiLayer->drawBackendInspector(m_inspectorState);
+        m_camera.setMode(m_inspectorState.cameraMode);
+        if (!m_context.hasNonSolidFill()) {
+            m_inspectorState.wireframe = false;
+        }
+    }
+
+    // Aggiorna UBO dopo gli input dell'UI (luce/acqua/camera)
+    updateFrameUBO(elapsedTime);
+
+    // 3. Registrazione dei comandi nel Command Buffer
+    VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
+    vkResetCommandBuffer(cmd, 0);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+
+    if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) {
+        throw std::runtime_error("Impossibile iniziare la registrazione del Command Buffer!");
+    }
+
+    const VkQueryPool queryPool = m_timestampQueryPools[m_currentFrame];
+    if (queryPool != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(cmd, queryPool, 0, QUERY_COUNT_PER_FRAME);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, queryPool, 0);
+    }
+
+    uint32_t frameDrawCalls = 0;
+    uint32_t frameTriangles = 0;
+
+    // =========================================================================
+    // PASS 1: Directional Shadow Depth Pass (2048x2048 Depth-Only)
+    // =========================================================================
+    {
+        ScopedCmdLabel shadowLabel(cmd, "Shadow Depth Pass", { 0.95f, 0.65f, 0.18f, 1.0f });
+
+        Image::transitionLayout(
+            cmd,
+            m_shadowMapImage.getHandle(),
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            0,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            VK_IMAGE_ASPECT_DEPTH_BIT
+        );
+
+        VkRenderingAttachmentInfo shadowDepthAttachment{};
+        shadowDepthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        shadowDepthAttachment.imageView = m_shadowMapImage.getView();
+        shadowDepthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        shadowDepthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        shadowDepthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        shadowDepthAttachment.clearValue.depthStencil = { 1.0f, 0 };
+
+        VkRenderingInfo shadowRenderingInfo{};
+        shadowRenderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        shadowRenderingInfo.renderArea.offset = { 0, 0 };
+        shadowRenderingInfo.renderArea.extent = { SHADOW_MAP_DIM, SHADOW_MAP_DIM };
+        shadowRenderingInfo.layerCount = 1;
+        shadowRenderingInfo.colorAttachmentCount = 0;
+        shadowRenderingInfo.pColorAttachments = nullptr;
+        shadowRenderingInfo.pDepthAttachment = &shadowDepthAttachment;
+
+        vkCmdBeginRendering(cmd, &shadowRenderingInfo);
+
+        VkViewport shadowViewport{};
+        shadowViewport.x = 0.0f;
+        shadowViewport.y = 0.0f;
+        shadowViewport.width = static_cast<float>(SHADOW_MAP_DIM);
+        shadowViewport.height = static_cast<float>(SHADOW_MAP_DIM);
+        shadowViewport.minDepth = 0.0f;
+        shadowViewport.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &shadowViewport);
+
+        VkRect2D shadowScissor{};
+        shadowScissor.offset = { 0, 0 };
+        shadowScissor.extent = { SHADOW_MAP_DIM, SHADOW_MAP_DIM };
+        vkCmdSetScissor(cmd, 0, 1, &shadowScissor);
+
+        vkCmdSetDepthBias(cmd, 1.25f, 0.0f, 1.75f);
+
+        m_shadowPipeline.bind(cmd, false);
+
+        if (m_context.hasPushDescriptors()) {
+            VkDescriptorBufferInfo bufferInfo{};
+            bufferInfo.buffer = m_uboBuffers[m_currentFrame].getHandle();
+            bufferInfo.offset = 0;
+            bufferInfo.range = sizeof(FrameUBO);
+
+            VkWriteDescriptorSet descriptorWrite{};
+            descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrite.dstSet = VK_NULL_HANDLE;
+            descriptorWrite.dstBinding = 0;
+            descriptorWrite.dstArrayElement = 0;
+            descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            descriptorWrite.descriptorCount = 1;
+            descriptorWrite.pBufferInfo = &bufferInfo;
+
+            m_context.cmdPushDescriptorSet(
+                cmd,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                m_shadowPipeline.getLayout(),
+                0,
+                1,
+                &descriptorWrite
+            );
+        } else {
+            vkCmdBindDescriptorSets(
+                cmd,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                m_shadowPipeline.getLayout(),
+                0,
+                1,
+                &m_fallbackShadowDescriptorSets[m_currentFrame],
+                0,
+                nullptr
+            );
+        }
+
+        PushConstants pc{};
+        pc.model = glm::mat4(1.0f);
+        pc.debugView = m_inspectorState.debugView;
+        pc.materialType = 0;
+        vkCmdPushConstants(
+            cmd,
+            m_shadowPipeline.getLayout(),
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            0,
+            sizeof(PushConstants),
+            &pc
+        );
+        m_terrainMesh.bindAndDraw(cmd);
+        ++frameDrawCalls;
+        frameTriangles += m_terrainMesh.getTriangleCount();
+
+        for (const auto& prop : m_propInstances) {
+            pc.model = prop.model;
+            vkCmdPushConstants(
+                cmd,
+                m_shadowPipeline.getLayout(),
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                0,
+                sizeof(PushConstants),
+                &pc
+            );
+            if (prop.isTree) {
+                m_treeMesh.bindAndDraw(cmd);
+                frameTriangles += m_treeMesh.getTriangleCount();
+            } else {
+                m_rockMesh.bindAndDraw(cmd);
+                frameTriangles += m_rockMesh.getTriangleCount();
+            }
+            ++frameDrawCalls;
+        }
+
+        vkCmdEndRendering(cmd);
+
+        if (queryPool != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, queryPool, 1);
+        }
+
+        Image::transitionLayout(
+            cmd,
+            m_shadowMapImage.getHandle(),
+            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            VK_IMAGE_ASPECT_DEPTH_BIT
+        );
+    }
+
+    // =========================================================================
+    // PASS 2: Main Low-Poly Pass (Color + Depth + 3x3 PCF Shadows + Dear ImGui)
+    // =========================================================================
+    {
+        ScopedCmdLabel passLabel(cmd, "Main Low-Poly Pass", { 0.18f, 0.55f, 0.95f, 1.0f });
+
+        if (queryPool != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, queryPool, 2);
+        }
+
+        Image::transitionLayout(
+            cmd,
+            m_swapchain.getImage(imageIndex),
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            0,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT
+        );
+
+        Image::transitionLayout(
+            cmd,
+            m_swapchain.getDepthImage(),
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+            0,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            VK_IMAGE_ASPECT_DEPTH_BIT
+        );
+
+        VkClearValue clearColor = {{{ 0.08f, 0.12f, 0.20f, 1.0f }}};
+
+        VkRenderingAttachmentInfo colorAttachment{};
+        colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        colorAttachment.imageView = m_swapchain.getImageView(imageIndex);
+        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachment.clearValue = clearColor;
+
+        VkRenderingAttachmentInfo depthAttachment{};
+        depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        depthAttachment.imageView = m_swapchain.getDepthImageView();
+        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.clearValue.depthStencil = { 1.0f, 0 };
+
+        VkRenderingInfo renderingInfo{};
+        renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        renderingInfo.renderArea.offset = { 0, 0 };
+        renderingInfo.renderArea.extent = m_swapchain.getExtent();
+        renderingInfo.layerCount = 1;
+        renderingInfo.colorAttachmentCount = 1;
+        renderingInfo.pColorAttachments = &colorAttachment;
+        renderingInfo.pDepthAttachment = &depthAttachment;
+
+        vkCmdBeginRendering(cmd, &renderingInfo);
+
+        VkViewport viewport{};
+        viewport.x = 0.0f;
+        viewport.y = 0.0f;
+        viewport.width = static_cast<float>(m_swapchain.getExtent().width);
+        viewport.height = static_cast<float>(m_swapchain.getExtent().height);
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+        VkRect2D scissor{};
+        scissor.offset = { 0, 0 };
+        scissor.extent = m_swapchain.getExtent();
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        if (m_context.hasPushDescriptors()) {
+            VkDescriptorBufferInfo bufferInfo{};
+            bufferInfo.buffer = m_uboBuffers[m_currentFrame].getHandle();
+            bufferInfo.offset = 0;
+            bufferInfo.range = sizeof(FrameUBO);
+
+            VkDescriptorImageInfo imageInfo{};
+            imageInfo.sampler = m_shadowSampler;
+            imageInfo.imageView = m_shadowMapImage.getView();
+            imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
+            descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[0].dstSet = VK_NULL_HANDLE;
+            descriptorWrites[0].dstBinding = 0;
+            descriptorWrites[0].dstArrayElement = 0;
+            descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            descriptorWrites[0].descriptorCount = 1;
+            descriptorWrites[0].pBufferInfo = &bufferInfo;
+
+            descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[1].dstSet = VK_NULL_HANDLE;
+            descriptorWrites[1].dstBinding = 1;
+            descriptorWrites[1].dstArrayElement = 0;
+            descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            descriptorWrites[1].descriptorCount = 1;
+            descriptorWrites[1].pImageInfo = &imageInfo;
+
+            m_context.cmdPushDescriptorSet(
+                cmd,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                m_pipeline.getLayout(),
+                0,
+                static_cast<uint32_t>(descriptorWrites.size()),
+                descriptorWrites.data()
+            );
+        } else {
+            vkCmdBindDescriptorSets(
+                cmd,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                m_pipeline.getLayout(),
+                0,
+                1,
+                &m_fallbackDescriptorSets[m_currentFrame],
+                0,
+                nullptr
+            );
+        }
+
+        // Sky Dome (sempre solid)
+        m_pipeline.bind(cmd, false);
+        PushConstants pc{};
+        pc.model = glm::translate(glm::mat4(1.0f), m_camera.getPosition());
+        pc.debugView = m_inspectorState.debugView;
+        pc.materialType = 2;
+        vkCmdPushConstants(
+            cmd,
+            m_pipeline.getLayout(),
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            0,
+            sizeof(PushConstants),
+            &pc
+        );
+        m_skyDomeMesh.bindAndDraw(cmd);
+        ++frameDrawCalls;
+        frameTriangles += m_skyDomeMesh.getTriangleCount();
+
+        // Scena Low-Poly (Fill o Wireframe)
+        m_pipeline.bind(cmd, m_inspectorState.wireframe);
+
+        pc.model = glm::mat4(1.0f);
+        pc.materialType = 0;
+        vkCmdPushConstants(
+            cmd,
+            m_pipeline.getLayout(),
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            0,
+            sizeof(PushConstants),
+            &pc
+        );
+        m_terrainMesh.bindAndDraw(cmd);
+        ++frameDrawCalls;
+        frameTriangles += m_terrainMesh.getTriangleCount();
+
+        for (const auto& prop : m_propInstances) {
+            pc.model = prop.model;
+            pc.materialType = 0;
+            vkCmdPushConstants(
+                cmd,
+                m_pipeline.getLayout(),
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                0,
+                sizeof(PushConstants),
+                &pc
+            );
+            if (prop.isTree) {
+                m_treeMesh.bindAndDraw(cmd);
+                frameTriangles += m_treeMesh.getTriangleCount();
+            } else {
+                m_rockMesh.bindAndDraw(cmd);
+                frameTriangles += m_rockMesh.getTriangleCount();
+            }
+            ++frameDrawCalls;
+        }
+
+        pc.model = glm::mat4(1.0f);
+        pc.materialType = 1;
+        vkCmdPushConstants(
+            cmd,
+            m_pipeline.getLayout(),
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            0,
+            sizeof(PushConstants),
+            &pc
+        );
+        m_waterMesh.bindAndDraw(cmd);
+        ++frameDrawCalls;
+        frameTriangles += m_waterMesh.getTriangleCount();
+
+        // Renderizzazione Dear ImGui Overlay dentro la Dynamic Rendering pass principale
+        if (m_imguiLayer) {
+            ScopedCmdLabel uiLabel(cmd, "ImGui Telemetry Overlay", { 0.45f, 0.85f, 0.45f, 1.0f });
+            m_imguiLayer->render(cmd);
+        }
+
+        vkCmdEndRendering(cmd);
+
+        Image::transitionLayout(
+            cmd,
+            m_swapchain.getImage(imageIndex),
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+            0,
+            VK_IMAGE_ASPECT_COLOR_BIT
+        );
+
+        if (queryPool != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, queryPool, 3);
+            m_queryPoolHasData[m_currentFrame] = true;
+        }
+    }
+
+    m_lastDrawCalls = frameDrawCalls;
+    m_lastRenderedTriangles = frameTriangles;
+
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        throw std::runtime_error("Impossibile registrare il Command Buffer!");
+    }
+
+    // 4. Invia comandi alla coda grafica con vkQueueSubmit2
+    VkCommandBufferSubmitInfo cmdSubmitInfo{};
+    cmdSubmitInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmdSubmitInfo.commandBuffer = cmd;
+
+    VkSemaphoreSubmitInfo waitSemaphoreInfo{};
+    waitSemaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    waitSemaphoreInfo.semaphore = m_imageAvailableSemaphores[m_currentFrame];
+    waitSemaphoreInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+    VkSemaphoreSubmitInfo signalSemaphoreInfo{};
+    signalSemaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    signalSemaphoreInfo.semaphore = m_renderFinishedSemaphores[imageIndex];
+    signalSemaphoreInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
+
+    VkSubmitInfo2 submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submitInfo.waitSemaphoreInfoCount = 1;
+    submitInfo.pWaitSemaphoreInfos = &waitSemaphoreInfo;
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    submitInfo.signalSemaphoreInfoCount = 1;
+    submitInfo.pSignalSemaphoreInfos = &signalSemaphoreInfo;
+
+    if (vkQueueSubmit2(m_context.getGraphicsQueue(), 1, &submitInfo, m_inFlightFences[m_currentFrame]) != VK_SUCCESS) {
+        throw std::runtime_error("Impossibile inviare i comandi alla coda grafica!");
+    }
+
+    // 5. Presentazione a schermo
+    result = m_swapchain.present(m_renderFinishedSemaphores[imageIndex], imageIndex);
+
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || m_window.wasResized()) {
+        m_window.resetResizedFlag();
+        recreateSwapchain();
+    } else if (result != VK_SUCCESS) {
+        throw std::runtime_error("Impossibile presentare l'immagine della Swapchain!");
+    }
+
+    // 6. Avanza al prossimo frame in volo
+    m_currentFrame = (m_currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+}
