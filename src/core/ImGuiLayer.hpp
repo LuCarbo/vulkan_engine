@@ -51,6 +51,15 @@ struct InspectorState {
     CameraMode cameraMode{CameraMode::Orbit};
     bool wireframe{false};
     int32_t debugView{0};
+
+    // PSX Retro Aesthetic Controls
+    bool psxEnabled{true};
+    int32_t psxResolutionPreset{1}; // 0 = 256x224, 1 = 320x240, 2 = 512x384, 3 = Native
+    float psxVertexSnap{1.0f};
+    bool psxAffineWarping{true};
+    bool psx15BitColor{true};
+    float psxDitherStrength{1.0f};
+    float psxFogFar{95.0f};
 };
 
 /**

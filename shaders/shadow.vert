@@ -13,6 +13,8 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     vec4 sunColorAmbient;       // rgb = sun color, a = ambient strength
     vec4 cameraPosTime;         // xyz = camera world pos, w = elapsed time (s)
     vec4 waterParams;           // x = waveSpeed, y = waveHeight, z = waterLevel, w = reserved
+    vec4 psxParams;             // x = enabled, y = internalWidth, z = internalHeight, w = ditherStrength
+    vec4 psxConfig;             // x = vertexSnapStrength, y = affineWarping, z = color15Bit, w = fogFar
 } ubo;
 
 layout(push_constant) uniform PushConstants {

@@ -46,6 +46,8 @@ struct alignas(16) FrameUBO {
     glm::vec4 sunColorAmbient{1.0f, 0.95f, 0.86f, 0.55f};
     glm::vec4 cameraPosTime{0.0f, 0.0f, 0.0f, 0.0f};
     glm::vec4 waterParams{1.6f, 0.14f, -0.25f, 0.0f};
+    glm::vec4 psxParams{1.0f, 320.0f, 240.0f, 1.0f}; // x = enabled, y = internalWidth, z = internalHeight, w = ditherStrength
+    glm::vec4 psxConfig{1.0f, 1.0f, 1.0f, 95.0f};    // x = vertexSnapStrength, y = affineWarping, z = color15Bit, w = fogFar
 };
 
 /**

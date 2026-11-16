@@ -254,6 +254,33 @@ void ImGuiLayer::drawBackendInspector(InspectorState& state) {
             state.totalBlocks);
     }
 
+    if (ImGui::CollapsingHeader("PSX Retro Aesthetic", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Enable PSX Mode (Key: P)", &state.psxEnabled);
+
+        ImGui::BeginDisabled(!state.psxEnabled);
+        static constexpr std::array<const char*, 4> kPsxResPresets = {
+            "256 x 224 (NTSC)",
+            "320 x 240 (PS1 Standard)",
+            "512 x 384 (PS1 Hi-Res)",
+            "Native Swapchain"
+        };
+
+        int resPreset = std::clamp(
+            static_cast<int>(state.psxResolutionPreset),
+            0,
+            static_cast<int>(kPsxResPresets.size()) - 1);
+        if (ImGui::Combo("Internal Resolution", &resPreset, kPsxResPresets.data(), static_cast<int>(kPsxResPresets.size()))) {
+            state.psxResolutionPreset = static_cast<int32_t>(resPreset);
+        }
+
+        ImGui::SliderFloat("GTE Vertex Jitter", &state.psxVertexSnap, 0.0f, 1.0f, "%.2f");
+        ImGui::Checkbox("Affine UV / Texel Warping", &state.psxAffineWarping);
+        ImGui::Checkbox("15-Bit Color (RGB555)", &state.psx15BitColor);
+        ImGui::SliderFloat("4x4 Bayer Dither", &state.psxDitherStrength, 0.0f, 1.5f, "%.2f");
+        ImGui::SliderFloat("Retro Fog Far", &state.psxFogFar, 40.0f, 260.0f, "%.1f m");
+        ImGui::EndDisabled();
+    }
+
     if (ImGui::CollapsingHeader("Lighting & Water", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::SliderFloat("Sun Azimuth", &state.sunAzimuthDeg, -180.0f, 180.0f, "%.1f deg");
         ImGui::SliderFloat("Sun Elevation", &state.sunElevationDeg, 8.0f, 85.0f, "%.1f deg");

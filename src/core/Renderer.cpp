@@ -20,6 +20,7 @@ Renderer::Renderer(const Context& context, Window& window, Swapchain& swapchain,
     createSyncObjects();
     createQueryPools();
     createShadowResources();
+    createPsxResources({ 320, 240 });
     createSceneResources();
 
     m_imguiLayer = std::make_unique<ImGuiLayer>(
@@ -42,7 +43,7 @@ Renderer::Renderer(const Context& context, Window& window, Swapchain& swapchain,
     std::cout << "[OK] Renderer 3D Low-Poly inizializzato (Frames in Flight: " << MAX_FRAMES_IN_FLIGHT
               << ", Shadow Map: " << SHADOW_MAP_DIM << "x" << SHADOW_MAP_DIM
               << ", ImGui Dynamic Rendering)." << std::endl;
-    std::cout << "[CONTROLLI] 1-4: Debug View | F: Wireframe | C: Orbit/Fly | WASD+RMB: Muovi Camera" << std::endl;
+    std::cout << "[CONTROLLI] 1-4: Debug View | F: Wireframe | C: Orbit/Fly | P: PSX Mode | WASD+RMB: Muovi Camera" << std::endl;
 }
 
 Renderer::~Renderer() {
@@ -69,6 +70,8 @@ Renderer::~Renderer() {
         m_shadowSampler = VK_NULL_HANDLE;
     }
     m_shadowMapImage.cleanup();
+    m_psxDepthImage.cleanup();
+    m_psxColorImage.cleanup();
 
     if (m_fallbackDescriptorPool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(m_context.getDevice(), m_fallbackDescriptorPool, nullptr);
@@ -242,6 +245,52 @@ void Renderer::createShadowResources() {
     );
 }
 
+VkExtent2D Renderer::resolvePsxExtent() const noexcept {
+    if (!m_inspectorState.psxEnabled) {
+        return m_swapchain.getExtent();
+    }
+
+    switch (m_inspectorState.psxResolutionPreset) {
+        case 0:
+            return { 256u, 224u };
+        case 1:
+            return { 320u, 240u };
+        case 2:
+            return { 512u, 384u };
+        case 3:
+        default:
+            return m_swapchain.getExtent();
+    }
+}
+
+void Renderer::createPsxResources(VkExtent2D extent) {
+    extent.width = (std::max)(extent.width, 1u);
+    extent.height = (std::max)(extent.height, 1u);
+
+    m_psxDepthImage.cleanup();
+    m_psxColorImage.cleanup();
+
+    m_psxColorImage = Image(
+        m_context,
+        extent,
+        m_swapchain.getImageFormat(),
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        "PSX Offscreen Color"
+    );
+
+    m_psxDepthImage = Image(
+        m_context,
+        extent,
+        m_swapchain.getDepthFormat(),
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        VK_IMAGE_ASPECT_DEPTH_BIT,
+        "PSX Offscreen Depth"
+    );
+
+    m_psxExtent = extent;
+}
+
 void Renderer::createSceneResources() {
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         const std::string uboName = "Frame UBO Buffer " + std::to_string(i);
@@ -389,6 +438,7 @@ void Renderer::processInput() {
     if (m_imguiLayer && m_imguiLayer->wantsCaptureKeyboard()) {
         m_keyFPressed = (glfwGetKey(handle, GLFW_KEY_F) == GLFW_PRESS);
         m_keyCPressed = (glfwGetKey(handle, GLFW_KEY_C) == GLFW_PRESS);
+        m_keyPPressed = (glfwGetKey(handle, GLFW_KEY_P) == GLFW_PRESS);
         return;
     }
 
@@ -409,6 +459,12 @@ void Renderer::processInput() {
         m_inspectorState.cameraMode = m_camera.getMode();
     }
     m_keyCPressed = cPressed;
+
+    const bool pPressed = (glfwGetKey(handle, GLFW_KEY_P) == GLFW_PRESS);
+    if (pPressed && !m_keyPPressed) {
+        m_inspectorState.psxEnabled = !m_inspectorState.psxEnabled;
+    }
+    m_keyPPressed = pPressed;
 }
 
 void Renderer::readTimestampQueries(uint32_t frameIndex) {
@@ -531,6 +587,8 @@ void Renderer::updateFrameUBO(float elapsedTime) {
     glm::mat4 lightProj = glm::ortho(-55.0f, 55.0f, -55.0f, 55.0f, 10.0f, 175.0f);
     lightProj[1][1] *= -1.0f;
 
+    const VkExtent2D renderExtent = resolvePsxExtent();
+
     FrameUBO ubo{};
     ubo.view = m_camera.getViewMatrix();
     ubo.proj = m_camera.getProjectionMatrix(aspectRatio);
@@ -540,6 +598,18 @@ void Renderer::updateFrameUBO(float elapsedTime) {
     ubo.sunColorAmbient = glm::vec4(1.0f, 0.95f, 0.86f, m_inspectorState.ambientStrength);
     ubo.cameraPosTime = glm::vec4(m_camera.getPosition(), elapsedTime);
     ubo.waterParams = glm::vec4(m_inspectorState.waterWaveSpeed, m_inspectorState.waterWaveHeight, -0.25f, 0.0f);
+    ubo.psxParams = glm::vec4(
+        m_inspectorState.psxEnabled ? 1.0f : 0.0f,
+        static_cast<float>((std::max)(renderExtent.width, 1u)),
+        static_cast<float>((std::max)(renderExtent.height, 1u)),
+        m_inspectorState.psxDitherStrength
+    );
+    ubo.psxConfig = glm::vec4(
+        m_inspectorState.psxVertexSnap,
+        m_inspectorState.psxAffineWarping ? 1.0f : 0.0f,
+        m_inspectorState.psx15BitColor ? 1.0f : 0.0f,
+        m_inspectorState.psxFogFar
+    );
 
     m_uboBuffers[m_currentFrame].upload(&ubo, sizeof(ubo), 0);
 }
@@ -641,7 +711,15 @@ void Renderer::renderFrame() {
         }
     }
 
-    // Aggiorna UBO dopo gli input dell'UI (luce/acqua/camera)
+    if (m_inspectorState.psxEnabled && m_inspectorState.psxResolutionPreset != 3) {
+        const VkExtent2D desiredExtent = resolvePsxExtent();
+        if (desiredExtent.width != m_psxExtent.width || desiredExtent.height != m_psxExtent.height) {
+            m_context.waitIdle();
+            createPsxResources(desiredExtent);
+        }
+    }
+
+    // Aggiorna UBO dopo gli input dell'UI (luce/acqua/camera/PSX)
     updateFrameUBO(elapsedTime);
 
     // 3. Registrazione dei comandi nel Command Buffer
@@ -811,7 +889,7 @@ void Renderer::renderFrame() {
     }
 
     // =========================================================================
-    // PASS 2: Main Low-Poly Pass (Color + Depth + 3x3 PCF Shadows + Dear ImGui)
+    // PASS 2: Main Low-Poly / PSX Pass (+ Nearest-Neighbor Blit & Dear ImGui)
     // =========================================================================
     {
         ScopedCmdLabel passLabel(cmd, "Main Low-Poly Pass", { 0.18f, 0.55f, 0.95f, 1.0f });
@@ -820,9 +898,17 @@ void Renderer::renderFrame() {
             vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, queryPool, 2);
         }
 
+        const bool useOffscreenPsx = m_inspectorState.psxEnabled && (m_inspectorState.psxResolutionPreset != 3);
+        const VkExtent2D swapExtent = m_swapchain.getExtent();
+        const VkExtent2D targetExtent = useOffscreenPsx ? m_psxExtent : swapExtent;
+        const VkImage targetColorImage = useOffscreenPsx ? m_psxColorImage.getHandle() : m_swapchain.getImage(imageIndex);
+        const VkImageView targetColorView = useOffscreenPsx ? m_psxColorImage.getView() : m_swapchain.getImageView(imageIndex);
+        const VkImage targetDepthImage = useOffscreenPsx ? m_psxDepthImage.getHandle() : m_swapchain.getDepthImage();
+        const VkImageView targetDepthView = useOffscreenPsx ? m_psxDepthImage.getView() : m_swapchain.getDepthImageView();
+
         Image::transitionLayout(
             cmd,
-            m_swapchain.getImage(imageIndex),
+            targetColorImage,
             VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -834,7 +920,7 @@ void Renderer::renderFrame() {
 
         Image::transitionLayout(
             cmd,
-            m_swapchain.getDepthImage(),
+            targetDepthImage,
             VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
             VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
@@ -848,7 +934,7 @@ void Renderer::renderFrame() {
 
         VkRenderingAttachmentInfo colorAttachment{};
         colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        colorAttachment.imageView = m_swapchain.getImageView(imageIndex);
+        colorAttachment.imageView = targetColorView;
         colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -856,7 +942,7 @@ void Renderer::renderFrame() {
 
         VkRenderingAttachmentInfo depthAttachment{};
         depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        depthAttachment.imageView = m_swapchain.getDepthImageView();
+        depthAttachment.imageView = targetDepthView;
         depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
         depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -865,7 +951,7 @@ void Renderer::renderFrame() {
         VkRenderingInfo renderingInfo{};
         renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
         renderingInfo.renderArea.offset = { 0, 0 };
-        renderingInfo.renderArea.extent = m_swapchain.getExtent();
+        renderingInfo.renderArea.extent = targetExtent;
         renderingInfo.layerCount = 1;
         renderingInfo.colorAttachmentCount = 1;
         renderingInfo.pColorAttachments = &colorAttachment;
@@ -876,15 +962,15 @@ void Renderer::renderFrame() {
         VkViewport viewport{};
         viewport.x = 0.0f;
         viewport.y = 0.0f;
-        viewport.width = static_cast<float>(m_swapchain.getExtent().width);
-        viewport.height = static_cast<float>(m_swapchain.getExtent().height);
+        viewport.width = static_cast<float>(targetExtent.width);
+        viewport.height = static_cast<float>(targetExtent.height);
         viewport.minDepth = 0.0f;
         viewport.maxDepth = 1.0f;
         vkCmdSetViewport(cmd, 0, 1, &viewport);
 
         VkRect2D scissor{};
         scissor.offset = { 0, 0 };
-        scissor.extent = m_swapchain.getExtent();
+        scissor.extent = targetExtent;
         vkCmdSetScissor(cmd, 0, 1, &scissor);
 
         if (m_context.hasPushDescriptors()) {
@@ -1006,13 +1092,148 @@ void Renderer::renderFrame() {
         ++frameDrawCalls;
         frameTriangles += m_waterMesh.getTriangleCount();
 
-        // Renderizzazione Dear ImGui Overlay dentro la Dynamic Rendering pass principale
-        if (m_imguiLayer) {
-            ScopedCmdLabel uiLabel(cmd, "ImGui Telemetry Overlay", { 0.45f, 0.85f, 0.45f, 1.0f });
-            m_imguiLayer->render(cmd);
-        }
+        if (!useOffscreenPsx) {
+            // Renderizzazione Dear ImGui Overlay dentro la Dynamic Rendering pass principale
+            if (m_imguiLayer) {
+                ScopedCmdLabel uiLabel(cmd, "ImGui Telemetry Overlay", { 0.45f, 0.85f, 0.45f, 1.0f });
+                m_imguiLayer->render(cmd);
+            }
 
-        vkCmdEndRendering(cmd);
+            vkCmdEndRendering(cmd);
+        } else {
+            vkCmdEndRendering(cmd);
+
+            // Nearest-Neighbor Blit dal target PSX a bassa risoluzione alla Swapchain nativa
+            {
+                ScopedCmdLabel blitLabel(cmd, "PSX Nearest Blit", { 0.90f, 0.45f, 0.85f, 1.0f });
+
+                Image::transitionLayout(
+                    cmd,
+                    m_psxColorImage.getHandle(),
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_BLIT_BIT,
+                    VK_ACCESS_2_TRANSFER_READ_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT
+                );
+
+                Image::transitionLayout(
+                    cmd,
+                    m_swapchain.getImage(imageIndex),
+                    VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    0,
+                    VK_PIPELINE_STAGE_2_BLIT_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT
+                );
+
+                VkImageBlit2 blitRegion{};
+                blitRegion.sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2;
+                blitRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                blitRegion.srcOffsets[0] = { 0, 0, 0 };
+                blitRegion.srcOffsets[1] = {
+                    static_cast<int32_t>(m_psxExtent.width),
+                    static_cast<int32_t>(m_psxExtent.height),
+                    1
+                };
+                blitRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                blitRegion.dstOffsets[0] = { 0, 0, 0 };
+                blitRegion.dstOffsets[1] = {
+                    static_cast<int32_t>(swapExtent.width),
+                    static_cast<int32_t>(swapExtent.height),
+                    1
+                };
+
+                VkBlitImageInfo2 blitInfo{};
+                blitInfo.sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2;
+                blitInfo.srcImage = m_psxColorImage.getHandle();
+                blitInfo.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                blitInfo.dstImage = m_swapchain.getImage(imageIndex);
+                blitInfo.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                blitInfo.regionCount = 1;
+                blitInfo.pRegions = &blitRegion;
+                blitInfo.filter = VK_FILTER_NEAREST;
+
+                vkCmdBlitImage2(cmd, &blitInfo);
+            }
+
+            // Passata UI nativa a risoluzione piena sopra l'immagine upscalata
+            Image::transitionLayout(
+                cmd,
+                m_swapchain.getImage(imageIndex),
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_BLIT_BIT,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT
+            );
+
+            Image::transitionLayout(
+                cmd,
+                m_swapchain.getDepthImage(),
+                VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                0,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT
+            );
+
+            if (m_imguiLayer) {
+                ScopedCmdLabel uiLabel(cmd, "ImGui Telemetry Overlay", { 0.45f, 0.85f, 0.45f, 1.0f });
+
+                VkRenderingAttachmentInfo uiColorAttachment{};
+                uiColorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                uiColorAttachment.imageView = m_swapchain.getImageView(imageIndex);
+                uiColorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                uiColorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                uiColorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+                VkRenderingAttachmentInfo uiDepthAttachment{};
+                uiDepthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                uiDepthAttachment.imageView = m_swapchain.getDepthImageView();
+                uiDepthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+                uiDepthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                uiDepthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                uiDepthAttachment.clearValue.depthStencil = { 1.0f, 0 };
+
+                VkRenderingInfo uiRenderingInfo{};
+                uiRenderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+                uiRenderingInfo.renderArea.offset = { 0, 0 };
+                uiRenderingInfo.renderArea.extent = swapExtent;
+                uiRenderingInfo.layerCount = 1;
+                uiRenderingInfo.colorAttachmentCount = 1;
+                uiRenderingInfo.pColorAttachments = &uiColorAttachment;
+                uiRenderingInfo.pDepthAttachment = &uiDepthAttachment;
+
+                vkCmdBeginRendering(cmd, &uiRenderingInfo);
+
+                VkViewport uiViewport{};
+                uiViewport.x = 0.0f;
+                uiViewport.y = 0.0f;
+                uiViewport.width = static_cast<float>(swapExtent.width);
+                uiViewport.height = static_cast<float>(swapExtent.height);
+                uiViewport.minDepth = 0.0f;
+                uiViewport.maxDepth = 1.0f;
+                vkCmdSetViewport(cmd, 0, 1, &uiViewport);
+
+                VkRect2D uiScissor{};
+                uiScissor.offset = { 0, 0 };
+                uiScissor.extent = swapExtent;
+                vkCmdSetScissor(cmd, 0, 1, &uiScissor);
+
+                m_imguiLayer->render(cmd);
+
+                vkCmdEndRendering(cmd);
+            }
+        }
 
         Image::transitionLayout(
             cmd,

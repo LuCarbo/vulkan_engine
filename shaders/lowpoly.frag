@@ -4,6 +4,8 @@ layout(location = 0) in vec3 fragWorldPos;
 layout(location = 1) in vec3 fragColor;
 layout(location = 2) in vec2 fragUV;
 layout(location = 3) in vec4 fragLightSpacePos;
+noperspective layout(location = 4) in vec3 fragColorAffine;
+noperspective layout(location = 5) in vec2 fragUVAffine;
 
 layout(set = 0, binding = 0) uniform FrameUBO {
     mat4 view;
@@ -14,6 +16,8 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     vec4 sunColorAmbient;       // rgb = sun color, a = ambient strength
     vec4 cameraPosTime;         // xyz = camera world pos, w = elapsed time (s)
     vec4 waterParams;           // x = waveSpeed, y = waveHeight, z = waterLevel, w = reserved
+    vec4 psxParams;             // x = enabled, y = internalWidth, z = internalHeight, w = ditherStrength
+    vec4 psxConfig;             // x = vertexSnapStrength, y = affineWarping, z = color15Bit, w = fogFar
 } ubo;
 
 layout(set = 0, binding = 1) uniform sampler2DShadow shadowMap;
@@ -47,6 +51,30 @@ vec3 elevationRamp(float t) {
     return mix(yellow, red, clamp((t - (2.0 / 3.0)) * 3.0, 0.0, 1.0));
 }
 
+vec3 applyPsxDitherAndQuantize(vec3 color, vec2 fragCoord, float ditherStrength, bool quantize15Bit) {
+    const int bayer4x4[16] = int[16](
+        -4,  0, -3,  1,
+         2, -2,  3, -1,
+        -3,  1, -4,  0,
+         3, -1,  2, -2
+    );
+    ivec2 px = ivec2(fragCoord) & 3;
+    float dither = (float(bayer4x4[px.y * 4 + px.x]) / 32.0) * (ditherStrength * 0.35);
+    vec3 c = clamp(color + vec3(dither), 0.0, 1.0);
+    if (quantize15Bit) {
+        c = floor(c * 31.0 + 0.5) / 31.0;
+    }
+    return c;
+}
+
+float samplePsxTexelPattern(vec2 uv, int materialType) {
+    float scale = (materialType == 0) ? 64.0 : 48.0;
+    ivec2 texel = ivec2(floor(uv * scale));
+    int checker = (texel.x ^ texel.y) & 1;
+    int subGrid = ((texel.x & 3) == 0 || (texel.y & 3) == 0) ? 1 : 0;
+    return 1.0 - float(checker) * 0.08 - float(subGrid) * 0.05;
+}
+
 float computeShadowPCF(vec4 lightSpacePos, float NdotL) {
     vec3 projCoords = lightSpacePos.xyz / lightSpacePos.w;
     vec2 uv = projCoords.xy * 0.5 + 0.5;
@@ -57,8 +85,13 @@ float computeShadowPCF(vec4 lightSpacePos, float NdotL) {
         return 0.0;
     }
 
-    vec2 texelSize = 1.0 / vec2(textureSize(shadowMap, 0));
     float bias = max(0.0012 * (1.0 - NdotL), 0.00025);
+    if (ubo.psxParams.x > 0.5) {
+        vec2 snappedUv = floor(uv * 512.0 + 0.5) / 512.0;
+        return texture(shadowMap, vec3(snappedUv, projCoords.z - bias));
+    }
+
+    vec2 texelSize = 1.0 / vec2(textureSize(shadowMap, 0));
     float shadowSum = 0.0;
     for (int x = -1; x <= 1; ++x) {
         for (int y = -1; y <= 1; ++y) {
@@ -69,6 +102,10 @@ float computeShadowPCF(vec4 lightSpacePos, float NdotL) {
 }
 
 void main() {
+    bool psxActive = (ubo.psxParams.x > 0.5);
+    bool affineActive = (ubo.psxConfig.y > 0.5);
+    bool quantize15Bit = (ubo.psxConfig.z > 0.5);
+
     // Crisp flat-shaded normal via screen-space derivatives with Vulkan Y-down orientation guard
     vec3 rawNormal = cross(dFdx(fragWorldPos), dFdy(fragWorldPos));
     vec3 flatNormal = safeNormalize(rawNormal, vec3(0.0, 1.0, 0.0));
@@ -102,6 +139,10 @@ void main() {
             vec3 warmSun = vec3(1.0, 0.90, 0.68) * ubo.sunColorAmbient.rgb;
             skyColor += warmSun * (sunHalo * 0.45 + sunDisc * 1.15);
 
+            if (psxActive) {
+                skyColor = applyPsxDitherAndQuantize(skyColor, gl_FragCoord.xy, ubo.psxParams.w, quantize15Bit);
+            }
+
             outColor = vec4(skyColor, 1.0);
         } else if (pc.debugView == 1) {
             outColor = vec4(flatNormal * 0.5 + 0.5, 1.0);
@@ -116,6 +157,7 @@ void main() {
     // Terrain / Props (0) and Water (1)
     vec3 L = sunDir;
     float NdotL = max(dot(flatNormal, L), 0.0);
+    float effectiveNdotL = psxActive ? (floor(NdotL * 6.0 + 0.5) / 6.0) : NdotL;
 
     vec3 skyAmbient = vec3(0.42, 0.56, 0.78);
     vec3 groundAmbient = vec3(0.22, 0.20, 0.16);
@@ -127,8 +169,15 @@ void main() {
     float NdotH = max(dot(flatNormal, H), 0.0);
     float specBase = (NdotH > 0.0) ? pow(NdotH, shininess) : 0.0;
     float spec = specBase * specStrength * step(0.01, NdotL);
+    float effectiveSpec = psxActive ? (floor(spec * 4.0 + 0.5) / 4.0) * 0.5 : spec;
 
     float shadowFactor = computeShadowPCF(fragLightSpacePos, NdotL);
+
+    vec3 baseColor = (psxActive && affineActive) ? fragColorAffine : fragColor;
+    vec2 activeUV = (psxActive && affineActive) ? fragUVAffine : fragUV;
+    if (psxActive && affineActive) {
+        baseColor *= samplePsxTexelPattern(activeUV, pc.materialType);
+    }
 
     switch (pc.debugView) {
         case 1: {
@@ -147,11 +196,19 @@ void main() {
         }
         case 0:
         default: {
-            vec3 directSun = ubo.sunColorAmbient.rgb * ubo.sunDirectionIntensity.w * NdotL * shadowFactor;
-            vec3 lit = fragColor * (ambient + directSun) + (spec * shadowFactor) * ubo.sunColorAmbient.rgb;
+            vec3 directSun = ubo.sunColorAmbient.rgb * ubo.sunDirectionIntensity.w * effectiveNdotL * shadowFactor;
+            vec3 lit = baseColor * (ambient + directSun) + (effectiveSpec * shadowFactor) * ubo.sunColorAmbient.rgb;
             float dist = length(ubo.cameraPosTime.xyz - fragWorldPos);
-            float fogFactor = smoothstep(75.0, 260.0, dist) * 0.55;
+            float fogFar = max(ubo.psxConfig.w, 25.0);
+            float fogNear = fogFar * 0.30;
+            float rawFog = smoothstep(fogNear, fogFar, dist);
+            float fogFactor = psxActive
+                ? (floor(rawFog * 8.0 + 0.5) / 8.0) * 0.88
+                : smoothstep(75.0, 260.0, dist) * 0.55;
             lit = mix(lit, horizonColor, fogFactor);
+            if (psxActive) {
+                lit = applyPsxDitherAndQuantize(lit, gl_FragCoord.xy, ubo.psxParams.w, quantize15Bit);
+            }
             outColor = vec4(lit, 1.0);
             break;
         }

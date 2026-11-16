@@ -72,6 +72,11 @@ private:
     VkSampler m_shadowSampler{VK_NULL_HANDLE};
     Pipeline m_shadowPipeline;
 
+    // Risorse Offscreen PSX Low-Resolution Pass
+    Image m_psxColorImage;
+    Image m_psxDepthImage;
+    VkExtent2D m_psxExtent{320, 240};
+
     // Risorse per frame & fallback descriptor (se pushDescriptor non supportato)
     std::array<Buffer, MAX_FRAMES_IN_FLIGHT> m_uboBuffers{};
     VkDescriptorPool m_fallbackDescriptorPool{VK_NULL_HANDLE};
@@ -104,6 +109,7 @@ private:
 
     bool m_keyFPressed{false};
     bool m_keyCPressed{false};
+    bool m_keyPPressed{false};
 
     uint32_t m_currentFrame{0};
 
@@ -113,6 +119,8 @@ private:
     void createQueryPools();
     void destroyQueryPools() noexcept;
     void createShadowResources();
+    void createPsxResources(VkExtent2D extent);
+    [[nodiscard]] VkExtent2D resolvePsxExtent() const noexcept;
     void createSceneResources();
     void populateProps();
     void processInput();
