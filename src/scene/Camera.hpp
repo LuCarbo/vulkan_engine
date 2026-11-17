@@ -46,7 +46,7 @@ private:
     glm::vec3 m_up{0.0f, 1.0f, 0.0f};
     glm::vec3 m_target{0.0f, 2.5f, 0.0f};
 
-    float m_orbitDistance{46.0f};
+    float m_orbitDistance{56.0f};
     float m_orbitPitch{24.0f};
     float m_orbitYaw{35.0f};
 

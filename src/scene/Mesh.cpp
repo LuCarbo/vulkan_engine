@@ -557,11 +557,11 @@ float Mesh::sampleTerrainHeight(float x, float z) noexcept {
     const float radialDist = std::sqrt(x * x + z * z);
     const float lakeDist = std::sqrt((x * 0.88f) * (x * 0.88f) + (z * 1.12f) * (z * 1.12f)) +
                            2.4f * valueNoise2D(x * 0.085f + 5.2f, z * 0.085f - 3.4f);
-    const float lakeDip = 3.90f * std::exp(-(lakeDist * lakeDist) / (14.5f * 14.5f));
+    const float lakeDip = 3.90f * std::exp(-(lakeDist * lakeDist) / (18.0f * 18.0f));
 
     const float base = 1.50f + 1.60f * fbm + 0.45f * std::sin(x * 0.12f) * std::cos(z * 0.10f);
 
-    const float tRim = std::clamp((radialDist - 23.0f) / 22.0f, 0.0f, 1.0f);
+    const float tRim = std::clamp((radialDist - 31.0f) / 28.0f, 0.0f, 1.0f);
     const float rimMask = tRim * tRim * (3.0f - 2.0f * tRim);
     const float mountainShape = 0.55f + 0.45f * std::cos(x * 0.068f - 0.6f) * std::sin(z * 0.072f + 1.1f);
     const float mountain = rimMask * (3.2f + 10.2f * ridge * (0.42f + 0.88f * mountainShape));
@@ -573,10 +573,10 @@ float Mesh::sampleTerrainHeight(float x, float z) noexcept {
     const float islandDetail = 0.22f * valueNoise2D(x * 0.42f + 3.1f, z * 0.42f - 2.7f);
     const float islandMound = (3.05f + islandDetail) * std::exp(-islandDistSq / (5.4f * 5.4f));
 
-    const float dxShoal = x + 8.5f;
-    const float dzShoal = z - 5.5f;
+    const float dxShoal = x + 10.5f;
+    const float dzShoal = z - 6.8f;
     const float shoalDistSq = dxShoal * dxShoal + dzShoal * dzShoal;
-    const float shoalMound = 1.65f * std::exp(-shoalDistSq / (4.2f * 4.2f));
+    const float shoalMound = 1.65f * std::exp(-shoalDistSq / (4.8f * 4.8f));
 
     return base - lakeDip + islandMound + shoalMound + mountain;
 }

@@ -60,16 +60,16 @@ public:
      */
     [[nodiscard]] static Mesh createTerrain(
         const Context& context,
-        uint32_t gridSize = 120,
-        float worldSize = 90.0f);
+        uint32_t gridSize = 150,
+        float worldSize = 120.0f);
 
     /**
      * @brief Generates a subdivided horizontal water surface mesh at the given water level.
      */
     [[nodiscard]] static Mesh createWaterPlane(
         const Context& context,
-        uint32_t gridSize = 90,
-        float worldSize = 90.0f,
+        uint32_t gridSize = 110,
+        float worldSize = 120.0f,
         float waterLevel = -0.25f);
 
     /**

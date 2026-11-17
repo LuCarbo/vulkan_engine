@@ -59,7 +59,7 @@ struct InspectorState {
     bool psxAffineWarping{true};
     bool psx15BitColor{true};
     float psxDitherStrength{1.0f};
-    float psxFogFar{95.0f};
+    float psxFogFar{125.0f};
 };
 
 /**

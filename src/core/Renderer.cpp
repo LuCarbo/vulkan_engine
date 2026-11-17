@@ -390,8 +390,8 @@ void Renderer::createSceneResources() {
     }
 
     m_skyDomeMesh = Mesh::createSkyDome(m_context, 350.0f);
-    m_terrainMesh = Mesh::createTerrain(m_context, 120, 90.0f);
-    m_waterMesh = Mesh::createWaterPlane(m_context, 90, 90.0f, -0.25f);
+    m_terrainMesh = Mesh::createTerrain(m_context, 150, 120.0f);
+    m_waterMesh = Mesh::createWaterPlane(m_context, 110, 120.0f, -0.25f);
     m_treeMesh = Mesh::loadFromObj(m_context, "assets/pine_tree.obj", { 0.14f, 0.45f, 0.20f });
     m_rockMesh = Mesh::loadFromObj(m_context, "assets/rock.obj", { 0.50f, 0.49f, 0.46f });
     m_goldTreeMesh = Mesh::createBroadleafTree(m_context, { 0.88f, 0.62f, 0.14f }, "Golden Autumn Tree Mesh");
@@ -436,8 +436,8 @@ void Renderer::populateProps() {
     constexpr float waterLevel = -0.25f;
     constexpr float islandX = 1.5f;
     constexpr float islandZ = -1.0f;
-    constexpr float overlookX = 16.5f;
-    constexpr float overlookZ = 13.5f;
+    constexpr float overlookX = 21.0f;
+    constexpr float overlookZ = 17.5f;
 
     // 1. Landmark: Central Lake Island Sanctuary
     {
@@ -480,18 +480,18 @@ void Renderer::populateProps() {
         float scale;
     };
     const std::array<SunkenPillarSpec, 10> lakePillars = {{
-        // Causeway approach from outer shore (-12, 8) across shoal (-8.5, 5.5) toward island (1.5, -1.0)
-        { -11.8f,  7.8f,  18.0f,  5.0f, -4.0f, 1.22f },
-        {  -9.6f,  6.2f,  62.0f, -7.0f,  6.0f, 1.28f },
-        {  -7.1f,  4.4f, 115.0f,  4.0f,  9.0f, 1.32f },
-        {  -4.6f,  2.4f, 205.0f, -9.0f, -5.0f, 1.38f },
-        // Sunken colonnade ring around the sanctuary island (~7.8m radius)
-        {   8.6f, -3.5f,  35.0f,  8.0f, -6.0f, 1.34f },
-        {   5.2f, -8.2f, 145.0f, -6.0f,  7.0f, 1.40f },
-        {  -3.8f, -7.2f, 240.0f, 11.0f,  4.0f, 1.36f },
-        {  -6.4f, -1.4f, 305.0f, -5.0f, -8.0f, 1.30f },
-        {   3.8f,  6.5f,  85.0f,  6.0f, 10.0f, 1.42f },
-        {   8.8f,  3.2f, 190.0f, -8.0f,  5.0f, 1.26f }
+        // Causeway approach from outer shore (-14.8, 9.6) across shoal (-10.5, 6.8) toward island (1.5, -1.0)
+        { -14.8f,  9.6f,  18.0f,  5.0f, -4.0f, 1.22f },
+        { -11.8f,  7.6f,  62.0f, -7.0f,  6.0f, 1.28f },
+        {  -8.6f,  5.3f, 115.0f,  4.0f,  9.0f, 1.32f },
+        {  -5.4f,  2.9f, 205.0f, -9.0f, -5.0f, 1.38f },
+        // Sunken colonnade ring around the sanctuary island (~9.5m radius)
+        {  10.4f, -4.2f,  35.0f,  8.0f, -6.0f, 1.34f },
+        {   6.4f, -9.8f, 145.0f, -6.0f,  7.0f, 1.40f },
+        {  -4.6f, -8.8f, 240.0f, 11.0f,  4.0f, 1.36f },
+        {  -7.8f, -1.8f, 305.0f, -5.0f, -8.0f, 1.30f },
+        {   4.6f,  7.8f,  85.0f,  6.0f, 10.0f, 1.42f },
+        {  10.6f,  3.8f, 190.0f, -8.0f,  5.0f, 1.26f }
     }};
 
     for (const auto& spec : lakePillars) {
@@ -508,9 +508,9 @@ void Renderer::populateProps() {
 
     // Half-submerged mossy boulders on the shallow ruin shoal
     const std::array<glm::vec3, 3> shoalRocks = {{
-        { -8.5f, 5.5f, 1.35f },
-        { -5.2f, 2.8f, 1.15f },
-        {  6.2f, 4.9f, 1.25f }
+        { -10.5f, 6.8f, 1.35f },
+        {  -6.4f, 3.5f, 1.15f },
+        {   7.5f, 5.8f, 1.25f }
     }};
     for (size_t i = 0; i < shoalRocks.size(); ++i) {
         const float rx = shoalRocks[i].x;
@@ -545,8 +545,8 @@ void Renderer::populateProps() {
     std::uniform_real_distribution<float> chanceDist(0.0f, 1.0f);
     std::uniform_real_distribution<float> speciesDist(0.0f, 1.0f);
 
-    for (float gx = -38.0f; gx <= 38.0f; gx += 3.6f) {
-        for (float gz = -38.0f; gz <= 38.0f; gz += 3.6f) {
+    for (float gx = -52.0f; gx <= 52.0f; gx += 3.8f) {
+        for (float gz = -52.0f; gz <= 52.0f; gz += 3.8f) {
             const float x = gx + jitterDist(rng);
             const float z = gz + jitterDist(rng);
 
@@ -815,13 +815,13 @@ void Renderer::updateFrameUBO(float elapsedTime) {
         std::cos(elevRad) * std::sin(azimRad)
     ));
 
-    const glm::vec3 lightPos = sunDir * 85.0f;
+    const glm::vec3 lightPos = sunDir * 105.0f;
     const glm::mat4 lightView = glm::lookAt(
         lightPos,
         glm::vec3(0.0f, 1.5f, 0.0f),
         glm::vec3(0.0f, 1.0f, 0.0f)
     );
-    glm::mat4 lightProj = glm::ortho(-55.0f, 55.0f, -55.0f, 55.0f, 10.0f, 175.0f);
+    glm::mat4 lightProj = glm::ortho(-72.0f, 72.0f, -72.0f, 72.0f, 10.0f, 210.0f);
     lightProj[1][1] *= -1.0f;
 
     const VkExtent2D renderExtent = resolvePsxExtent();

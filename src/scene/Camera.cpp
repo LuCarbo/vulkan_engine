@@ -6,7 +6,7 @@
 namespace {
 
 constexpr float ORBIT_MIN_DISTANCE = 12.0f;
-constexpr float ORBIT_MAX_DISTANCE = 140.0f;
+constexpr float ORBIT_MAX_DISTANCE = 175.0f;
 constexpr float ORBIT_MIN_PITCH = -15.0f;
 constexpr float ORBIT_MAX_PITCH = 80.0f;
 constexpr float FLY_MAX_PITCH = 89.0f;

@@ -277,7 +277,7 @@ void ImGuiLayer::drawBackendInspector(InspectorState& state) {
         ImGui::Checkbox("Affine UV / Texel Warping", &state.psxAffineWarping);
         ImGui::Checkbox("15-Bit Color (RGB555)", &state.psx15BitColor);
         ImGui::SliderFloat("4x4 Bayer Dither", &state.psxDitherStrength, 0.0f, 1.5f, "%.2f");
-        ImGui::SliderFloat("Retro Fog Far", &state.psxFogFar, 40.0f, 260.0f, "%.1f m");
+        ImGui::SliderFloat("Retro Fog Far", &state.psxFogFar, 40.0f, 320.0f, "%.1f m");
         ImGui::EndDisabled();
     }
 
